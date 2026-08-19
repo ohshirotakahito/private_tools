@@ -29,8 +29,34 @@ import matplotlib.patheffects as pe
 plt.style.use('dark_background')
 
 ACCENT_COLOR = '#39FF14'      # 再生ヘッドなどのネオン色
-GRID_COLOR = '#333333'
+ACCENT_COLOR2 = '#00E5FF'     # サブアクセント（シアン系）
+GRID_COLOR = '#2A2A2A'
 FONT_MONO = 'DejaVu Sans Mono'
+
+# --- 展示会向け: 遠目からでも見やすいよう文字/線を全体的に太く大きく ---
+FS_TITLE = 20      # 大見出し
+FS_HUD = 34         # 読み取り中コードのHUD表示
+FS_SUB = 14         # HUDの補足行
+FS_LABEL = 13       # 軸ラベル・パネルタイトル
+FS_TICK = 11        # 目盛りラベル
+FS_TRACK = 13       # 配列トラックの文字ラベル
+FS_STATUS = 12      # ステータス行（reads assembled等）
+FS_LEGEND = 12
+
+LW_THICK = 2.6      # 主要ライン
+LW_MED = 1.8
+_GLOW_STROKE = [pe.withStroke(linewidth=5, foreground='black')]  # 発光文字の縁取り
+
+
+def _glow_line(ax, x_or_fn, color, base_lw, base_alpha=0.9, layers=((9, 0.06), (5, 0.12), (2.5, 0.22))):
+    """ネオン管のような発光ラインを作るため、太さ違いの半透明レイヤーを重ねて返す"""
+    glow_artists = [
+        ax.axvline(0, color=color, linewidth=w, alpha=a, zorder=9, solid_capstyle='round')
+        for w, a in layers
+    ]
+    core = ax.axvline(0, color=color, linewidth=base_lw, alpha=base_alpha, zorder=10)
+    return glow_artists, core
+
 
 # スクリプト自身の場所を基準にする（どのディレクトリから実行しても動くように）
 BASE_DIR = Path(__file__).resolve().parent
@@ -89,6 +115,17 @@ def _logit(p, eps=1e-3):
 
 def _sigmoid(x):
     return 1.0 / (1.0 + np.exp(-x))
+
+
+def _prob_to_qscore(p, q_cap=60.0):
+    """確信度(0-1)をPhredクオリティスコアに変換: Q = -10*log10(1-p)"""
+    p = np.clip(p, 0.0, 1.0 - 10 ** (-q_cap / 10.0))
+    error = np.clip(1.0 - p, 10 ** (-q_cap / 10.0), 1.0)
+    return -10.0 * np.log10(error)
+
+
+PASS_Q_THRESHOLD = 9.0  # ONT等でよく使われる合格ライン（Q9 ≈ 87.4%）に合わせる
+PASS_CONF_THRESHOLD = 1.0 - 10 ** (-PASS_Q_THRESHOLD / 10.0)
 
 
 code_info = load_code_info(selectBC)
@@ -165,6 +202,15 @@ n_seg = len(seg_start_t)
 # 　confidence = sigmoid(LL_true - LL_best_rival)
 # これなら無関係な候補が何個あっても影響を受けず、実際に紛らわしい
 # 相手とどれだけ差がついたかだけで確信度が決まる。
+#
+# さらに、正解コードはアラインメント（文字列一致）で既に確定している
+# ため、「その回のノイズでたまたま競合コードの方が尤もらしく見えた
+# （confidence<0.5）」としても、それは「間違っている証拠」ではなく
+# 単に「その1回の読みでは情報が弱かった」というだけ。ベルヌーイ試行
+# ベースの多数決モデル（e<0.5を仮定するCondorcetの陪審定理）と同じ
+# 前提に合わせるため、confidenceは0.5を下限としてクリップする。
+# これにより対数オッズへの寄与は必ず0以上になり、Depthが増えるほど
+# 単調にコンセンサス精度が上がっていく（マイナスに転じない）。
 # ============================
 seg_end_idx = np.empty_like(seg_start_idx)
 seg_end_idx[:-1] = seg_start_idx[1:] - 1
@@ -172,6 +218,9 @@ seg_end_idx[-1] = n_total - 1
 
 _code_to_prob_idx = {c: i for i, c in enumerate(prob_codes)}
 seg_confidence = np.full(n_seg, np.nan)
+_seg_rival_code = np.full(n_seg, '', dtype=object)  # 診断用: どのコードに負けたか
+_seg_raw_conf = np.full(n_seg, np.nan)               # 診断用: クリップ前の確信度
+_CONF_FLOOR = 0.5  # 二択ロジスティックの下限（これを下回る分は「情報なし」扱い）
 
 for _si in range(n_seg):
     _code = seg_codes[_si]
@@ -186,24 +235,64 @@ for _si in range(n_seg):
     _true_idx = _code_to_prob_idx[_code]
     _ll_true = _log_lik[_true_idx]
     if len(prob_codes) > 1:
-        _ll_rest = np.delete(_log_lik, _true_idx)
-        _ll_best_rival = float(_ll_rest.max())
+        _rest_idx = np.delete(np.arange(len(prob_codes)), _true_idx)
+        _best_rival_pos = _rest_idx[np.argmax(_log_lik[_rest_idx])]
+        _ll_best_rival = float(_log_lik[_best_rival_pos])
+        _seg_rival_code[_si] = str(prob_codes[_best_rival_pos])
     else:
         _ll_best_rival = -np.inf  # 候補が1つしかない場合は無条件で確信度1
 
-    seg_confidence[_si] = _sigmoid(_ll_true - _ll_best_rival)
+    _raw_conf = _sigmoid(_ll_true - _ll_best_rival)
+    _seg_raw_conf[_si] = _raw_conf
+    seg_confidence[_si] = max(_raw_conf, _CONF_FLOOR)
 
 # --- 診断用: 確信度の分布を確認（原因切り分けのため） ---
 _valid_conf = seg_confidence[~np.isnan(seg_confidence)]
 if len(_valid_conf) > 0:
     print(
         f"[diag] 候補コード数={len(prob_codes)}   "
-        f"seg_confidence(2択版): min={_valid_conf.min():.3f} "
+        f"seg_confidence(2択版・0.5下限クリップ後): min={_valid_conf.min():.3f} "
         f"median={np.median(_valid_conf):.3f} "
         f"mean={_valid_conf.mean():.3f} "
-        f"max={_valid_conf.max():.3f}   "
-        f"0.5未満の割合={float((_valid_conf < 0.5).mean()) * 100:.1f}%"
+        f"max={_valid_conf.max():.3f}"
     )
+
+# --- 診断用: 基準値(R_conductance)の一覧をソートして表示 ---
+# 近接している(差がnoise_amplitudeに対して小さい)コード同士は、原理的に
+# 混同されやすい（物理的に紛らわしい）ペアである可能性が高い。
+print(f"[diag] noise_amplitude = {noise_amplitude:.4f}")
+_order = np.argsort(prob_values)
+print("[diag] R_conductance 一覧（昇順）と隣接コードとの差:")
+for _k in range(len(_order)):
+    _oi = _order[_k]
+    _c, _v = prob_codes[_oi], prob_values[_oi]
+    if _k > 0:
+        _prev_v = prob_values[_order[_k - 1]]
+        _gap = _v - _prev_v
+        _gap_str = f"  (直前との差: {_gap:.4f} / noise比: {_gap / noise_amplitude:.2f})"
+    else:
+        _gap_str = ""
+    print(f"    {_c}: {_v:.4f}{_gap_str}")
+
+# --- 診断用: 実際にreference_sequenceで使われているコードごとに
+#     「本当の確信度」と「誰に負け続けているか」を集計 ---
+print("[diag] reference_sequenceで使われるコードごとの内訳:")
+for _c in sorted(set(reference_sequence)):
+    _mask = (seg_codes == _c) & ~np.isnan(_seg_raw_conf)
+    if not np.any(_mask):
+        continue
+    _raws = _seg_raw_conf[_mask]
+    _rivals = _seg_rival_code[_mask]
+    _rival_vals, _rival_counts = np.unique(_rivals[_rivals != ''], return_counts=True)
+    _top_rival = _rival_vals[np.argmax(_rival_counts)] if len(_rival_vals) > 0 else '-'
+    _lose_rate = float((_raws < 0.5).mean()) * 100
+    print(
+        f"    {_c}: 生confidence mean={_raws.mean():.3f}  "
+        f"0.5未満の割合={_lose_rate:.1f}%  "
+        f"最頻の競合相手={_top_rival}"
+    )
+
+
 
 
 def visible_segment_range(t_start, t_now):
@@ -294,6 +383,8 @@ while _i < n_seg:
         'align_end': align_end,
         'orientation': orientation,
         'pos_conf': pos_conf,
+        'length': len(frag_str),
+        'mean_conf': float(np.mean(frag_confs)) if len(frag_confs) > 0 else np.nan,
     })
     _i = _j
 
@@ -318,16 +409,17 @@ gif_fps = 30
 # ============================
 # 描画準備
 # ============================
-fig = plt.figure(figsize=(14, 7))
-gs = fig.add_gridspec(3, 2, width_ratios=[3.4, 1.1], height_ratios=[5, 1, 0.9], hspace=0.35, wspace=0.28)
+fig = plt.figure(figsize=(18, 9.2))
+gs = fig.add_gridspec(3, 2, width_ratios=[3.4, 1.1], height_ratios=[5, 1, 0.9], hspace=0.4, wspace=0.26)
 ax_wave = fig.add_subplot(gs[0, 0])
 ax_track = fig.add_subplot(gs[1, 0], sharex=ax_wave)
 ax_trail = fig.add_subplot(gs[2, 0])
 ax_prob = fig.add_subplot(gs[0:2, 1])
 
 # --- 波形パネル ---
-line_raw, = ax_wave.plot([], [], linewidth=0.8, alpha=0.6, color='#4FC3F7', label='Raw Signal')
-line_assigned, = ax_wave.plot([], [], linewidth=1.8, color='#FFFFFF', label='Assigned Signal')
+line_raw, = ax_wave.plot([], [], linewidth=1.1, alpha=0.55, color=ACCENT_COLOR2, label='Raw Signal')
+line_assigned, = ax_wave.plot([], [], linewidth=LW_THICK, color='#FFFFFF', label='Assigned Signal',
+                               path_effects=[pe.withStroke(linewidth=LW_THICK + 2.5, foreground='#0a3a2a')])
 
 # Raw信号に重ねる「電子ノイズ」風の点滅パーティクル
 _particle_rng = np.random.default_rng()
@@ -338,40 +430,46 @@ particle_scatter = ax_wave.scatter(
 
 margin = 0.1 * (all_raw.max() - all_raw.min() + 1e-9)
 ax_wave.set_ylim(all_raw.min() - margin, all_raw.max() + margin)
-ax_wave.set_ylabel('Value')
+ax_wave.set_ylabel('Value', fontsize=FS_LABEL, fontfamily=FONT_MONO)
+ax_wave.tick_params(axis='both', labelsize=FS_TICK)
 ax_wave.grid(True, color=GRID_COLOR, alpha=0.5)
-ax_wave.legend(loc='upper right', framealpha=0.3)
+ax_wave.legend(loc='upper right', framealpha=0.25, fontsize=FS_LEGEND, edgecolor=GRID_COLOR)
 plt.setp(ax_wave.get_xticklabels(), visible=False)
-title = ax_wave.set_title('', fontsize=11, fontfamily=FONT_MONO)
+title = ax_wave.set_title(
+    '', fontsize=FS_TITLE, fontfamily=FONT_MONO, color=ACCENT_COLOR, fontweight='bold',
+    path_effects=_GLOW_STROKE,
+)
 
 # プレイヘッドを「グロー（発光）」に見せるため、太さ違いの半透明レイヤーを重ねる
 playhead_wave_glow = [
     ax_wave.axvline(0, color=ACCENT_COLOR, linewidth=w, alpha=a, zorder=9, solid_capstyle='round')
-    for w, a in [(10, 0.05), (6, 0.09), (3, 0.18)]
+    for w, a in [(14, 0.05), (9, 0.10), (4.5, 0.22)]
 ]
-playhead_wave_core = ax_wave.axvline(0, color=ACCENT_COLOR, linewidth=1.1, alpha=0.9, zorder=10)
+playhead_wave_core = ax_wave.axvline(0, color=ACCENT_COLOR, linewidth=1.6, alpha=0.95, zorder=10)
 
 # 波形とAssigned信号の交点＝「今まさに判定されている値」を示すマーカー
-marker_glow = ax_wave.scatter([0], [0], s=500, color=ACCENT_COLOR, alpha=0.12, zorder=11, linewidths=0)
-marker_ring = ax_wave.scatter([0], [0], s=160, color=ACCENT_COLOR, alpha=0.30, zorder=11, linewidths=0)
+marker_glow = ax_wave.scatter([0], [0], s=750, color=ACCENT_COLOR, alpha=0.12, zorder=11, linewidths=0)
+marker_ring = ax_wave.scatter([0], [0], s=230, color=ACCENT_COLOR, alpha=0.32, zorder=11, linewidths=0)
 marker_core = ax_wave.scatter(
-    [0], [0], s=55, color=ACCENT_COLOR, edgecolor='white', linewidth=1.2, zorder=12,
+    [0], [0], s=80, color=ACCENT_COLOR, edgecolor='white', linewidth=1.6, zorder=12,
 )
 
 # 波形上部に「スキャナーの照準」のようなキャレットマーカー
-scan_caret = ax_wave.scatter([0], [0], marker='v', s=90, color=ACCENT_COLOR, zorder=13)
+scan_caret = ax_wave.scatter([0], [0], marker='v', s=130, color=ACCENT_COLOR, zorder=13)
 
 # --- 配列トラックパネル ---
 ax_track.set_ylim(0, 1)
 ax_track.set_yticks([])
-ax_track.set_xlabel('Time')
+ax_track.set_xlabel('Time', fontsize=FS_LABEL, fontfamily=FONT_MONO)
+ax_track.tick_params(axis='x', labelsize=FS_TICK)
 ax_track.grid(False)
+
 
 playhead_track_glow = [
     ax_track.axvline(0, color=ACCENT_COLOR, linewidth=w, alpha=a, zorder=9, solid_capstyle='round')
-    for w, a in [(10, 0.05), (6, 0.09), (3, 0.18)]
+    for w, a in [(14, 0.05), (9, 0.10), (4.5, 0.22)]
 ]
-playhead_track_core = ax_track.axvline(0, color=ACCENT_COLOR, linewidth=1.1, alpha=0.9, zorder=10)
+playhead_track_core = ax_track.axvline(0, color=ACCENT_COLOR, linewidth=1.6, alpha=0.95, zorder=10)
 
 # --- 読み取り履歴トレイルパネル（字幕のように過去に読んだコードが薄く流れていく） ---
 trail_window = 8 * window_width  # どれだけ過去まで遡って表示するか（時間幅）
@@ -384,13 +482,13 @@ ax_trail.set_facecolor('#050505')
 for spine in ax_trail.spines.values():
     spine.set_visible(False)
 ax_trail.text(
-    trail_window, 1.15, 'READ HISTORY', ha='right', va='bottom',
-    fontsize=8, color='#666666', fontfamily=FONT_MONO,
+    trail_window, 1.18, 'READ HISTORY', ha='right', va='bottom',
+    fontsize=FS_TICK, color='#888888', fontfamily=FONT_MONO, fontweight='bold',
 )
-ax_trail.axvline(trail_window, color=ACCENT_COLOR, alpha=0.4, linewidth=1.0)
+ax_trail.axvline(trail_window, color=ACCENT_COLOR, alpha=0.5, linewidth=1.6)
 ax_trail.text(
-    trail_window, -0.25, 'now', ha='right', va='top',
-    fontsize=7, color=ACCENT_COLOR, alpha=0.6, fontfamily=FONT_MONO,
+    trail_window, -0.3, 'now', ha='right', va='top',
+    fontsize=FS_TICK, color=ACCENT_COLOR, alpha=0.75, fontfamily=FONT_MONO, fontweight='bold',
 )
 
 # 事前計算: 'B'（ベースライン）以外のセグメントだけを履歴対象にする
@@ -408,23 +506,26 @@ ax_prob.set_xlim(0, 1.0)
 ax_prob.set_ylim(-0.6, n_prob_rows - 0.4)
 ax_prob.invert_yaxis()  # 1位を一番上に
 ax_prob.set_xticks([0, 0.5, 1.0])
-ax_prob.set_xticklabels(['0%', '50%', '100%'], fontsize=8, color='#888888')
+ax_prob.set_xticklabels(['0%', '50%', '100%'], fontsize=FS_TICK, color='#999999')
 ax_prob.set_yticks([])
 ax_prob.set_facecolor('#0A0A0A')
 for spine in ax_prob.spines.values():
-    spine.set_color('#333333')
+    spine.set_color('#3A3A3A')
 ax_prob.grid(axis='x', color=GRID_COLOR, alpha=0.4)
-ax_prob.set_title('CONFIDENCE', fontsize=10, fontfamily=FONT_MONO, color='#888888', pad=10)
+ax_prob.set_title(
+    'CONFIDENCE', fontsize=FS_LABEL + 1, fontfamily=FONT_MONO, color=ACCENT_COLOR,
+    fontweight='bold', pad=12, path_effects=_GLOW_STROKE,
+)
 
 prob_status_text = ax_prob.text(
     0.5, n_prob_rows - 0.55, '', ha='center', va='top',
-    fontsize=8, fontfamily=FONT_MONO, color='#666666',
+    fontsize=FS_TICK, fontfamily=FONT_MONO, color='#888888', fontweight='bold',
 )
 
 # パフォーマンス対策: 毎フレーム生成・削除せず、固定個数のオブジェクトを
 # 使い回す（add_patch/removeの再計算コストを避けるため）
 prob_bars = [
-    mpatches.Rectangle((0, r - 0.32), 0.001, 0.64, facecolor='#888888', alpha=0.6, edgecolor='none', zorder=2)
+    mpatches.Rectangle((0, r - 0.34), 0.001, 0.68, facecolor='#888888', alpha=0.6, edgecolor='none', zorder=2)
     for r in range(n_prob_rows)
 ]
 for b in prob_bars:
@@ -434,31 +535,41 @@ prob_glow = mpatches.Rectangle((0, -0.36), 1.0, 0.72, fill=False, edgecolor=ACCE
 ax_prob.add_patch(prob_glow)
 
 prob_name_labels = [
-    ax_prob.text(0.02, r, '', ha='left', va='center', fontsize=8.5,
-                 fontfamily=FONT_MONO, color='#DDDDDD', zorder=4)
+    ax_prob.text(0.02, r, '', ha='left', va='center', fontsize=FS_TICK + 1, fontweight='bold',
+                 fontfamily=FONT_MONO, color='#EEEEEE', zorder=4)
     for r in range(n_prob_rows)
 ]
 prob_pct_labels = [
-    ax_prob.text(0.985, r, '', ha='right', va='center', fontsize=8,
-                 fontfamily=FONT_MONO, color='#888888', zorder=4)
+    ax_prob.text(0.985, r, '', ha='right', va='center', fontsize=FS_TICK, fontweight='bold',
+                 fontfamily=FONT_MONO, color='#999999', zorder=4)
     for r in range(n_prob_rows)
 ]
 
-# --- 「現在読み取り中」表示パネル（HUD風） ---
-_glow_stroke = [pe.withStroke(linewidth=4, foreground='black')]
+# --- ブランドタイトル（展示会向け・大きく発光させる） ---
+brand_title = fig.text(
+    0.5, 0.995, 'MOLECULE CALLER', fontsize=FS_TITLE + 12, fontweight='bold',
+    fontfamily=FONT_MONO, color=ACCENT_COLOR, va='top', ha='center',
+    path_effects=[pe.withStroke(linewidth=7, foreground='black')],
+)
+brand_subtitle = fig.text(
+    0.5, 0.925, 'REAL-TIME NANOPORE SIGNAL DECODER', fontsize=FS_LABEL, fontweight='bold',
+    fontfamily=FONT_MONO, color='#999999', va='top', ha='center',
+    alpha=0.85,
+)
 
+# --- 「現在読み取り中」表示パネル（HUD風） ---
 readout_box = fig.text(
-    0.13, 0.94, '', fontsize=24, fontweight='bold', fontfamily=FONT_MONO,
-    color=ACCENT_COLOR, va='top', ha='left', path_effects=_glow_stroke,
-    bbox=dict(boxstyle='round,pad=0.4', fc='#0A0A0A', ec=ACCENT_COLOR, lw=2.0, alpha=0.9),
+    0.13, 0.86, '', fontsize=FS_HUD, fontweight='bold', fontfamily=FONT_MONO,
+    color=ACCENT_COLOR, va='top', ha='left', path_effects=_GLOW_STROKE,
+    bbox=dict(boxstyle='round,pad=0.5', fc='#0A0A0A', ec=ACCENT_COLOR, lw=2.6, alpha=0.92),
 )
 readout_sub = fig.text(
-    0.135, 0.825, '', fontsize=10, fontfamily=FONT_MONO,
-    color='#BBBBBB', va='top', ha='left',
+    0.137, 0.71, '', fontsize=FS_SUB + 1, fontfamily=FONT_MONO, fontweight='bold',
+    color='#DDDDDD', va='top', ha='left',
 )
 readout_val = fig.text(
-    0.135, 0.788, '', fontsize=9, fontfamily=FONT_MONO,
-    color='#888888', va='top', ha='left',
+    0.137, 0.663, '', fontsize=FS_SUB, fontfamily=FONT_MONO,
+    color=ACCENT_COLOR2, va='top', ha='left',
 )
 
 # ============================
@@ -466,13 +577,17 @@ readout_val = fig.text(
 # 完成した読み取り断片を元配列にアラインメントし、pileup（重なり depth）として
 # 積み上げて表示する。メインウインドウと同じ update() ループで同期させる。
 # ============================
-fig2 = plt.figure(figsize=(8, 4.5))
+fig2 = plt.figure(figsize=(11, 9.4))
 fig2.patch.set_facecolor('#000000')
-fig2.suptitle('SEQUENCE ASSEMBLY', fontsize=12, fontfamily=FONT_MONO, color='#888888')
+fig2.suptitle(
+    'SEQUENCE ASSEMBLY', fontsize=FS_TITLE + 2, fontfamily=FONT_MONO, color=ACCENT_COLOR,
+    fontweight='bold', path_effects=_GLOW_STROKE, y=0.985,
+)
 
-gs2 = fig2.add_gridspec(2, 1, height_ratios=[1, 3], hspace=0.5)
+gs2 = fig2.add_gridspec(3, 1, height_ratios=[1, 2.6, 1.1], hspace=0.65)
 ax_ref = fig2.add_subplot(gs2[0])
 ax_depth = fig2.add_subplot(gs2[1], sharex=ax_ref)
+ax_yield = fig2.add_subplot(gs2[2])
 
 # --- 基準配列（reference）トラック ---
 ax_ref.set_xlim(0, _ref_len)
@@ -488,15 +603,16 @@ for _p, _c in enumerate(reference_sequence):
     _info = code_info.get(_c, {'color': '#888888', 'name': _c})
     _box = mpatches.FancyBboxPatch(
         (_p + 0.06, 0.1), 0.88, 0.8, boxstyle='round,pad=0.02,rounding_size=0.08',
-        facecolor=_info['color'], edgecolor='white', linewidth=1.2, zorder=2,
+        facecolor=_info['color'], edgecolor='white', linewidth=1.6, zorder=2,
     )
     ax_ref.add_patch(_box)
     ax_ref.text(
-        _p + 0.5, 0.5, _c, ha='center', va='center', fontsize=16, fontweight='bold',
+        _p + 0.5, 0.5, _c, ha='center', va='center', fontsize=22, fontweight='bold',
         fontfamily=FONT_MONO, color=contrasting_text_color(_info['color']), zorder=3,
     )
     ref_boxes.append(_box)
-ax_ref.set_title('reference', fontsize=8, fontfamily=FONT_MONO, color='#666666', loc='left')
+ax_ref.set_title('reference', fontsize=FS_LABEL, fontfamily=FONT_MONO, color='#999999',
+                  fontweight='bold', loc='left')
 
 # 現在ハイライト中の断片を示す縁取り（毎フレーム位置とアルファを更新）
 ref_highlight = mpatches.FancyBboxPatch(
@@ -509,18 +625,20 @@ ax_ref.add_patch(ref_highlight)
 ax_depth.set_xlim(0, _ref_len)
 ax_depth.set_ylim(0, 5)
 ax_depth.set_xticks(np.arange(_ref_len) + 0.5)
-ax_depth.set_xticklabels(list(reference_sequence), fontfamily=FONT_MONO, fontsize=10)
-ax_depth.set_ylabel('depth', fontsize=9, color='#888888')
+ax_depth.set_xticklabels(list(reference_sequence), fontfamily=FONT_MONO, fontsize=FS_TICK + 2,
+                          fontweight='bold')
+ax_depth.tick_params(axis='y', labelsize=FS_TICK)
+ax_depth.set_ylabel('depth', fontsize=FS_LABEL, color='#AAAAAA', fontweight='bold')
 ax_depth.grid(axis='y', color=GRID_COLOR, alpha=0.4)
 ax_depth.set_facecolor('#0A0A0A')
 for spine in ax_depth.spines.values():
-    spine.set_color('#333333')
+    spine.set_color('#3A3A3A')
 
 depth_counts = np.zeros(_ref_len)
 depth_bars = ax_depth.bar(
     np.arange(_ref_len) + 0.5, depth_counts, width=0.7,
     color=[code_info.get(c, {'color': '#888888'})['color'] for c in reference_sequence],
-    edgecolor='white', linewidth=0.8, alpha=0.85, zorder=2,
+    edgecolor='white', linewidth=1.2, alpha=0.9, zorder=2,
 )
 
 # --- コンセンサス精度（達成精度）の折れ線 ---
@@ -531,33 +649,94 @@ depth_logodds = np.zeros(_ref_len)  # 位置ごとに対数オッズを蓄積（
 ax_acc = ax_depth.twinx()
 ax_acc.set_ylim(0, 1.02)
 ax_acc.set_yticks([0, 0.5, 1.0])
-ax_acc.set_yticklabels(['0%', '50%', '100%'], fontsize=8, color=ACCENT_COLOR)
+ax_acc.set_yticklabels(['0%', '50%', '100%'], fontsize=FS_TICK, color=ACCENT_COLOR, fontweight='bold')
 ax_acc.tick_params(axis='y', colors=ACCENT_COLOR)
-ax_acc.set_ylabel('accuracy', fontsize=9, color=ACCENT_COLOR)
+ax_acc.set_ylabel('accuracy', fontsize=FS_LABEL, color=ACCENT_COLOR, fontweight='bold')
 for spine in ax_acc.spines.values():
     spine.set_visible(False)
 
 acc_x = np.arange(_ref_len) + 0.5
+# ネオン管のような発光ラインに見せるため、太さ違いのレイヤーを重ねる
+acc_line_glow = [
+    ax_acc.plot(acc_x, np.full(_ref_len, np.nan), color=ACCENT_COLOR, linewidth=w, alpha=a,
+                zorder=4, solid_capstyle='round')[0]
+    for w, a in [(9, 0.08), (5, 0.15)]
+]
 acc_line, = ax_acc.plot(
-    acc_x, np.full(_ref_len, np.nan), color=ACCENT_COLOR, marker='o', markersize=4,
-    linewidth=1.4, alpha=0.9, zorder=5, label='consensus accuracy',
+    acc_x, np.full(_ref_len, np.nan), color=ACCENT_COLOR, marker='o', markersize=7,
+    markeredgecolor='white', markeredgewidth=0.8,
+    linewidth=LW_MED, alpha=0.95, zorder=5, label='consensus accuracy',
 )
-ax_acc.axhline(0.9, color=ACCENT_COLOR, linestyle=':', linewidth=1.0, alpha=0.3)
+ax_acc.axhline(0.9, color=ACCENT_COLOR, linestyle=':', linewidth=1.4, alpha=0.35)
 
-assembly_status_text = fig2.text(
-    0.02, 0.02, '', fontsize=9, fontfamily=FONT_MONO, color='#AAAAAA', va='bottom', ha='left',
+# --- Yield / スループット（累積アサイン塩基数の推移） ---
+ax_yield.set_xlabel('time', fontsize=FS_LABEL, color='#AAAAAA', fontweight='bold')
+ax_yield.set_ylabel('yield (bases)', fontsize=FS_LABEL, color='#AAAAAA', fontweight='bold')
+ax_yield.set_facecolor('#0A0A0A')
+ax_yield.grid(True, color=GRID_COLOR, alpha=0.4)
+ax_yield.tick_params(axis='both', labelsize=FS_TICK, colors='#AAAAAA')
+for spine in ax_yield.spines.values():
+    spine.set_color('#3A3A3A')
+
+_yield_t_hist = []  # 診断/描画用に時刻を蓄積
+_yield_v_hist = []  # 累積アサイン塩基数を蓄積
+yield_line, = ax_yield.plot(
+    [], [], color=ACCENT_COLOR2, linewidth=LW_MED, alpha=0.95, zorder=3,
+    path_effects=[pe.withStroke(linewidth=LW_MED + 2.5, foreground='#00303a')],
 )
-latest_frag_text = fig2.text(
-    0.98, 0.02, '', fontsize=9, fontfamily=FONT_MONO, color=ACCENT_COLOR, va='bottom', ha='right',
+yield_head = ax_yield.scatter([0], [0], s=55, color=ACCENT_COLOR2, edgecolor='white',
+                               linewidth=1.0, zorder=4)
+
+# --- 精度のヒーロー表示（一番の注目指標として大きく強調） ---
+hero_label = fig2.text(
+    0.5, 0.925, 'MEAN CONSENSUS ACCURACY', fontsize=FS_LABEL, fontweight='bold',
+    fontfamily=FONT_MONO, color='#999999', va='top', ha='center', alpha=0.9,
+)
+hero_value = fig2.text(
+    0.5, 0.905, '', fontsize=FS_HUD + 6, fontweight='bold', fontfamily=FONT_MONO,
+    color=ACCENT_COLOR, va='top', ha='center',
+    path_effects=[pe.withStroke(linewidth=7, foreground='black')],
+)
+hero_qsub = fig2.text(
+    0.5, 0.795, '', fontsize=FS_SUB + 2, fontweight='bold', fontfamily=FONT_MONO,
+    color=ACCENT_COLOR2, va='top', ha='center',
 )
 
-fig2.subplots_adjust(left=0.08, right=0.95, top=0.82, bottom=0.14)
+# --- 副指標を本物のテーブルウィジェットとして表示 ---
+ax_stats = fig2.add_axes([0.04, 0.655, 0.92, 0.085])
+ax_stats.axis('off')
+
+_stat_col_labels = ['READS', 'DEPTH', 'YIELD', 'N50', 'DEPTH CV', 'PASS RATE (\u2265Q9)', 'LATEST READ']
+stats_table = ax_stats.table(
+    cellText=[['-'] * len(_stat_col_labels)],
+    colLabels=_stat_col_labels,
+    cellLoc='center', colLoc='center', loc='center',
+)
+stats_table.auto_set_font_size(False)
+stats_table.set_fontsize(FS_TICK)
+stats_table.scale(1.0, 2.6)
+for (_r, _c), _cell in stats_table.get_celld().items():
+    _cell.set_edgecolor(GRID_COLOR)
+    _cell.set_linewidth(1.2)
+    if _r == 0:
+        _cell.set_facecolor('#141414')
+        _cell.get_text().set_color('#999999')
+        _cell.get_text().set_fontweight('bold')
+    else:
+        _cell.set_facecolor('#0A0A0A')
+        _cell.get_text().set_color(ACCENT_COLOR2)
+        _cell.get_text().set_fontweight('bold')
+        _cell.get_text().set_fontfamily(FONT_MONO)
+    _cell.get_text().set_fontfamily(FONT_MONO)
+
+fig2.subplots_adjust(left=0.10, right=0.90, top=0.62, bottom=0.08)
 
 # アセンブリの状態（フレームをまたいで保持する）
 _next_frag_idx = 0
 _reveal_time = -999.0
 _reveal_frag = None
 _frag_reveal_decay = 1.2  # ハイライトが消えるまでの時間幅
+_cumulative_yield = 0     # Yield計算用: これまでにアサインされた塩基数の累積
 
 # 動的に追加/削除する描画要素をまとめて管理
 dynamic_artists = []
@@ -647,7 +826,7 @@ def update(frame):
             txt_color = contrasting_text_color(color)
             label = ax_track.text(
                 seg_l + width / 2, 0.5, code,
-                ha='center', va='center', fontsize=9, fontweight='bold',
+                ha='center', va='center', fontsize=FS_TRACK, fontweight='bold',
                 fontfamily=FONT_MONO, color=txt_color, zorder=2,
             )
             dynamic_artists.append(label)
@@ -663,8 +842,8 @@ def update(frame):
     # --- run境界の縦線 ---
     for run_idx, start_t in run_boundaries:
         if t_start <= start_t <= t_start + window_width:
-            ln1 = ax_wave.axvline(start_t, color='#888888', linestyle='--', alpha=0.5, zorder=3)
-            ln2 = ax_track.axvline(start_t, color='#888888', linestyle='--', alpha=0.5, zorder=3)
+            ln1 = ax_wave.axvline(start_t, color='#999999', linestyle='--', linewidth=1.4, alpha=0.55, zorder=3)
+            ln2 = ax_track.axvline(start_t, color='#999999', linestyle='--', linewidth=1.4, alpha=0.55, zorder=3)
             dynamic_artists.extend([ln1, ln2])
 
     # --- 読み取り履歴トレイル（字幕のように過去に読んだコードが右から左へ薄く流れる） ---
@@ -683,7 +862,7 @@ def update(frame):
         x = trail_window - max(elapsed, edge_margin)  # 新しいほど右、古いほど左
         age_frac = elapsed / trail_window
         alpha = float(np.clip(1.0 - age_frac, 0.05, 1.0))
-        fontsize = 13 - 4 * age_frac
+        fontsize = 17 - 5 * age_frac
         info = code_info.get(code, {'color': '#AAAAAA'})
         txt = ax_trail.text(
             x, 0.5, code, ha='center', va='center', clip_on=False,
@@ -837,10 +1016,11 @@ def update(frame):
     # ============================
     # アセンブリパネル（別ウインドウ fig2）の更新
     # ============================
-    global _next_frag_idx, _reveal_time, _reveal_frag
+    global _next_frag_idx, _reveal_time, _reveal_frag, _cumulative_yield
 
     while _next_frag_idx < n_frag and frag_end_times[_next_frag_idx] <= playhead_t:
         frag = fragments[_next_frag_idx]
+        _cumulative_yield += frag['length']
         if frag['align_start'] is not None:
             depth_counts[frag['align_start']:frag['align_end']] += 1
             for _pos, _conf in frag['pos_conf']:
@@ -859,7 +1039,44 @@ def update(frame):
     consensus_accuracy = _sigmoid(depth_logodds)
     acc_y = np.where(covered, consensus_accuracy, np.nan)
     acc_line.set_data(acc_x, acc_y)
+    for _gl in acc_line_glow:
+        _gl.set_data(acc_x, acc_y)
     mean_accuracy = float(consensus_accuracy[covered].mean()) if covered.any() else 0.0
+    mean_q = _prob_to_qscore(mean_accuracy) if mean_accuracy > 0 else 0.0
+
+    # --- Depthの均一性（変動係数 CV = 標準偏差 / 平均。小さいほどムラが少ない） ---
+    if covered.sum() >= 2:
+        _d = depth_counts[covered]
+        depth_cv = float(_d.std() / _d.mean())
+    else:
+        depth_cv = 0.0
+
+    # --- N50（読み取り断片の長さの代表値） ---
+    _lengths = np.array([f['length'] for f in fragments[:_next_frag_idx]])
+    if len(_lengths) > 0:
+        _sorted_len = np.sort(_lengths)[::-1]
+        _cum = np.cumsum(_sorted_len)
+        _half = _cum[-1] / 2.0
+        n50 = int(_sorted_len[np.searchsorted(_cum, _half)])
+    else:
+        n50 = 0
+
+    # --- Pass率（PASS_Q_THRESHOLDを超えたリードの割合） ---
+    _confs = np.array([
+        f['mean_conf'] for f in fragments[:_next_frag_idx] if not np.isnan(f['mean_conf'])
+    ])
+    if len(_confs) > 0:
+        pass_rate = float((_confs >= PASS_CONF_THRESHOLD).mean()) * 100
+    else:
+        pass_rate = 0.0
+
+    # --- Yield / スループット（時間 vs 累積アサイン塩基数） ---
+    _yield_t_hist.append(playhead_t)
+    _yield_v_hist.append(_cumulative_yield)
+    yield_line.set_data(_yield_t_hist, _yield_v_hist)
+    ax_yield.set_xlim(0, max(playhead_t * 1.05, 1e-3))
+    ax_yield.set_ylim(0, max(_cumulative_yield * 1.15, 5))
+    yield_head.set_offsets([[playhead_t, _cumulative_yield]])
 
     if _reveal_frag is not None:
         age = playhead_t - _reveal_time
@@ -870,15 +1087,33 @@ def update(frame):
         ref_highlight.set_alpha(fade)
 
         arrow = '\u2192' if _reveal_frag['orientation'] == 'fwd' else '\u2190'
-        latest_frag_text.set_text(
-            f"latest: {_reveal_frag['text']} {arrow}  "
-            f"@ ref[{a_s}:{a_e}]"
-        )
-    assembly_status_text.set_text(
-        f"reads assembled: {_next_frag_idx} / {n_frag}   "
-        f"total depth: {int(depth_counts.sum())}   "
-        f"mean accuracy: {mean_accuracy * 100:5.1f}%"
-    )
+        latest_read_str = f"{_reveal_frag['text']} {arrow} ref[{a_s}:{a_e}]"
+    else:
+        latest_read_str = '-'
+
+    # --- 精度のヒーロー表示 ---
+    hero_value.set_text(f"{mean_accuracy * 100:.1f}%")
+    hero_qsub.set_text(f"Phred Q {mean_q:.1f}")
+    # 精度に応じて色を段階的に変化させる（低=橙 / 中=黄緑 / 高=ネオン緑）
+    if mean_accuracy >= 0.99:
+        hero_value.set_color(ACCENT_COLOR)
+    elif mean_accuracy >= 0.9:
+        hero_value.set_color('#B6FF3B')
+    else:
+        hero_value.set_color('#FFB020')
+
+    # --- 副指標テーブルの更新 ---
+    _stat_values = [
+        f"{_next_frag_idx} / {n_frag}",
+        f"{int(depth_counts.sum())}",
+        f"{_cumulative_yield} bp",
+        f"{n50}",
+        f"{depth_cv:.2f}",
+        f"{pass_rate:.1f}%",
+        latest_read_str,
+    ]
+    for _ci, _val in enumerate(_stat_values):
+        stats_table.get_celld()[(1, _ci)].get_text().set_text(_val)
 
     fig2.canvas.draw_idle()
 
@@ -889,7 +1124,7 @@ def update(frame):
         + [marker_glow, marker_ring, marker_core, scan_caret]
         + dynamic_artists + trail_artists
         + prob_bars + [prob_glow] + prob_name_labels + prob_pct_labels
-        + [acc_line]
+        + [acc_line, yield_line, yield_head] + acc_line_glow
     )
 
 
@@ -900,7 +1135,7 @@ ani = animation.FuncAnimation(
     interval=interval_ms, blit=False, repeat=False,
 )
 
-fig.subplots_adjust(left=0.07, right=0.98, top=0.90, bottom=0.08)
+fig.subplots_adjust(left=0.06, right=0.98, top=0.60, bottom=0.07)
 
 
 # ============================
@@ -927,8 +1162,8 @@ def _position_figure_window(fig, x, y):
         pass  # 対応していないバックエンド／環境では何もしない
 
 
-_position_figure_window(fig, 40, 40)     # メインウインドウ: 左上
-_position_figure_window(fig2, 980, 60)   # アセンブリウインドウ: その右側
+_position_figure_window(fig, 20, 20)       # メインウインドウ: 左上（大画面/プロジェクタ想定でやや大きめ）
+_position_figure_window(fig2, 1500, 40)    # アセンブリウインドウ: その右側（デュアルモニタ推奨）
 
 if save_as_gif:
     out_path = save_dir / 'streaming_signal_v2.gif'

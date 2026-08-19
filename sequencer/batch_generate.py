@@ -51,14 +51,15 @@ def assigned_form_with_codes(sequence, values):
 # ============================
 # パラメータ（ここを変更して使う）
 # ============================
-sequence = "CYFQNCPRG"            # 元配列
+#sequence = "CYFQNCPRG"    # vassp@resin       # 元配列
+sequence = "CYIQNCPLG" #osytosine
 selectBC = 'Amino_01phos'   # BC/{selectBC}.csv を参照
 fn = 1                      # 部分配列の最小長
 sn = 100                    # 1回あたりのシグナル数
 
 num_runs = 100                # 生成する波形の本数
 noise_seed_base = 42         # 各runで seed=base+run_idx とする。Noneなら毎回ランダム
-noise_amplitude = 0.10
+noise_amplitude = 0.05
 drift_strength = 0.002
 signal_dependent_noise = False
 

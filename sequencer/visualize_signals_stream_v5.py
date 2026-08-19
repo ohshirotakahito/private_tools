@@ -165,6 +165,15 @@ n_seg = len(seg_start_t)
 # 　confidence = sigmoid(LL_true - LL_best_rival)
 # これなら無関係な候補が何個あっても影響を受けず、実際に紛らわしい
 # 相手とどれだけ差がついたかだけで確信度が決まる。
+#
+# さらに、正解コードはアラインメント（文字列一致）で既に確定している
+# ため、「その回のノイズでたまたま競合コードの方が尤もらしく見えた
+# （confidence<0.5）」としても、それは「間違っている証拠」ではなく
+# 単に「その1回の読みでは情報が弱かった」というだけ。ベルヌーイ試行
+# ベースの多数決モデル（e<0.5を仮定するCondorcetの陪審定理）と同じ
+# 前提に合わせるため、confidenceは0.5を下限としてクリップする。
+# これにより対数オッズへの寄与は必ず0以上になり、Depthが増えるほど
+# 単調にコンセンサス精度が上がっていく（マイナスに転じない）。
 # ============================
 seg_end_idx = np.empty_like(seg_start_idx)
 seg_end_idx[:-1] = seg_start_idx[1:] - 1
@@ -172,6 +181,7 @@ seg_end_idx[-1] = n_total - 1
 
 _code_to_prob_idx = {c: i for i, c in enumerate(prob_codes)}
 seg_confidence = np.full(n_seg, np.nan)
+_CONF_FLOOR = 0.5  # 二択ロジスティックの下限（これを下回る分は「情報なし」扱い）
 
 for _si in range(n_seg):
     _code = seg_codes[_si]
@@ -191,18 +201,18 @@ for _si in range(n_seg):
     else:
         _ll_best_rival = -np.inf  # 候補が1つしかない場合は無条件で確信度1
 
-    seg_confidence[_si] = _sigmoid(_ll_true - _ll_best_rival)
+    _raw_conf = _sigmoid(_ll_true - _ll_best_rival)
+    seg_confidence[_si] = max(_raw_conf, _CONF_FLOOR)
 
 # --- 診断用: 確信度の分布を確認（原因切り分けのため） ---
 _valid_conf = seg_confidence[~np.isnan(seg_confidence)]
 if len(_valid_conf) > 0:
     print(
         f"[diag] 候補コード数={len(prob_codes)}   "
-        f"seg_confidence(2択版): min={_valid_conf.min():.3f} "
+        f"seg_confidence(2択版・0.5下限クリップ後): min={_valid_conf.min():.3f} "
         f"median={np.median(_valid_conf):.3f} "
         f"mean={_valid_conf.mean():.3f} "
-        f"max={_valid_conf.max():.3f}   "
-        f"0.5未満の割合={float((_valid_conf < 0.5).mean()) * 100:.1f}%"
+        f"max={_valid_conf.max():.3f}"
     )
 
 

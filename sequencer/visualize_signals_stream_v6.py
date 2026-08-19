@@ -91,6 +91,17 @@ def _sigmoid(x):
     return 1.0 / (1.0 + np.exp(-x))
 
 
+def _prob_to_qscore(p, q_cap=60.0):
+    """確信度(0-1)をPhredクオリティスコアに変換: Q = -10*log10(1-p)"""
+    p = np.clip(p, 0.0, 1.0 - 10 ** (-q_cap / 10.0))
+    error = np.clip(1.0 - p, 10 ** (-q_cap / 10.0), 1.0)
+    return -10.0 * np.log10(error)
+
+
+PASS_Q_THRESHOLD = 9.0  # ONT等でよく使われる合格ライン（Q9 ≈ 87.4%）に合わせる
+PASS_CONF_THRESHOLD = 1.0 - 10 ** (-PASS_Q_THRESHOLD / 10.0)
+
+
 code_info = load_code_info(selectBC)
 
 # 確率密度（信頼度）計算用: 基準値(R_conductance)が定義されているコードだけを候補にする
@@ -165,6 +176,15 @@ n_seg = len(seg_start_t)
 # 　confidence = sigmoid(LL_true - LL_best_rival)
 # これなら無関係な候補が何個あっても影響を受けず、実際に紛らわしい
 # 相手とどれだけ差がついたかだけで確信度が決まる。
+#
+# さらに、正解コードはアラインメント（文字列一致）で既に確定している
+# ため、「その回のノイズでたまたま競合コードの方が尤もらしく見えた
+# （confidence<0.5）」としても、それは「間違っている証拠」ではなく
+# 単に「その1回の読みでは情報が弱かった」というだけ。ベルヌーイ試行
+# ベースの多数決モデル（e<0.5を仮定するCondorcetの陪審定理）と同じ
+# 前提に合わせるため、confidenceは0.5を下限としてクリップする。
+# これにより対数オッズへの寄与は必ず0以上になり、Depthが増えるほど
+# 単調にコンセンサス精度が上がっていく（マイナスに転じない）。
 # ============================
 seg_end_idx = np.empty_like(seg_start_idx)
 seg_end_idx[:-1] = seg_start_idx[1:] - 1
@@ -172,6 +192,9 @@ seg_end_idx[-1] = n_total - 1
 
 _code_to_prob_idx = {c: i for i, c in enumerate(prob_codes)}
 seg_confidence = np.full(n_seg, np.nan)
+_seg_rival_code = np.full(n_seg, '', dtype=object)  # 診断用: どのコードに負けたか
+_seg_raw_conf = np.full(n_seg, np.nan)               # 診断用: クリップ前の確信度
+_CONF_FLOOR = 0.5  # 二択ロジスティックの下限（これを下回る分は「情報なし」扱い）
 
 for _si in range(n_seg):
     _code = seg_codes[_si]
@@ -186,24 +209,64 @@ for _si in range(n_seg):
     _true_idx = _code_to_prob_idx[_code]
     _ll_true = _log_lik[_true_idx]
     if len(prob_codes) > 1:
-        _ll_rest = np.delete(_log_lik, _true_idx)
-        _ll_best_rival = float(_ll_rest.max())
+        _rest_idx = np.delete(np.arange(len(prob_codes)), _true_idx)
+        _best_rival_pos = _rest_idx[np.argmax(_log_lik[_rest_idx])]
+        _ll_best_rival = float(_log_lik[_best_rival_pos])
+        _seg_rival_code[_si] = str(prob_codes[_best_rival_pos])
     else:
         _ll_best_rival = -np.inf  # 候補が1つしかない場合は無条件で確信度1
 
-    seg_confidence[_si] = _sigmoid(_ll_true - _ll_best_rival)
+    _raw_conf = _sigmoid(_ll_true - _ll_best_rival)
+    _seg_raw_conf[_si] = _raw_conf
+    seg_confidence[_si] = max(_raw_conf, _CONF_FLOOR)
 
 # --- 診断用: 確信度の分布を確認（原因切り分けのため） ---
 _valid_conf = seg_confidence[~np.isnan(seg_confidence)]
 if len(_valid_conf) > 0:
     print(
         f"[diag] 候補コード数={len(prob_codes)}   "
-        f"seg_confidence(2択版): min={_valid_conf.min():.3f} "
+        f"seg_confidence(2択版・0.5下限クリップ後): min={_valid_conf.min():.3f} "
         f"median={np.median(_valid_conf):.3f} "
         f"mean={_valid_conf.mean():.3f} "
-        f"max={_valid_conf.max():.3f}   "
-        f"0.5未満の割合={float((_valid_conf < 0.5).mean()) * 100:.1f}%"
+        f"max={_valid_conf.max():.3f}"
     )
+
+# --- 診断用: 基準値(R_conductance)の一覧をソートして表示 ---
+# 近接している(差がnoise_amplitudeに対して小さい)コード同士は、原理的に
+# 混同されやすい（物理的に紛らわしい）ペアである可能性が高い。
+print(f"[diag] noise_amplitude = {noise_amplitude:.4f}")
+_order = np.argsort(prob_values)
+print("[diag] R_conductance 一覧（昇順）と隣接コードとの差:")
+for _k in range(len(_order)):
+    _oi = _order[_k]
+    _c, _v = prob_codes[_oi], prob_values[_oi]
+    if _k > 0:
+        _prev_v = prob_values[_order[_k - 1]]
+        _gap = _v - _prev_v
+        _gap_str = f"  (直前との差: {_gap:.4f} / noise比: {_gap / noise_amplitude:.2f})"
+    else:
+        _gap_str = ""
+    print(f"    {_c}: {_v:.4f}{_gap_str}")
+
+# --- 診断用: 実際にreference_sequenceで使われているコードごとに
+#     「本当の確信度」と「誰に負け続けているか」を集計 ---
+print("[diag] reference_sequenceで使われるコードごとの内訳:")
+for _c in sorted(set(reference_sequence)):
+    _mask = (seg_codes == _c) & ~np.isnan(_seg_raw_conf)
+    if not np.any(_mask):
+        continue
+    _raws = _seg_raw_conf[_mask]
+    _rivals = _seg_rival_code[_mask]
+    _rival_vals, _rival_counts = np.unique(_rivals[_rivals != ''], return_counts=True)
+    _top_rival = _rival_vals[np.argmax(_rival_counts)] if len(_rival_vals) > 0 else '-'
+    _lose_rate = float((_raws < 0.5).mean()) * 100
+    print(
+        f"    {_c}: 生confidence mean={_raws.mean():.3f}  "
+        f"0.5未満の割合={_lose_rate:.1f}%  "
+        f"最頻の競合相手={_top_rival}"
+    )
+
+
 
 
 def visible_segment_range(t_start, t_now):
@@ -294,6 +357,8 @@ while _i < n_seg:
         'align_end': align_end,
         'orientation': orientation,
         'pos_conf': pos_conf,
+        'length': len(frag_str),
+        'mean_conf': float(np.mean(frag_confs)) if len(frag_confs) > 0 else np.nan,
     })
     _i = _j
 
@@ -466,13 +531,14 @@ readout_val = fig.text(
 # 完成した読み取り断片を元配列にアラインメントし、pileup（重なり depth）として
 # 積み上げて表示する。メインウインドウと同じ update() ループで同期させる。
 # ============================
-fig2 = plt.figure(figsize=(8, 4.5))
+fig2 = plt.figure(figsize=(8.6, 6.4))
 fig2.patch.set_facecolor('#000000')
 fig2.suptitle('SEQUENCE ASSEMBLY', fontsize=12, fontfamily=FONT_MONO, color='#888888')
 
-gs2 = fig2.add_gridspec(2, 1, height_ratios=[1, 3], hspace=0.5)
+gs2 = fig2.add_gridspec(3, 1, height_ratios=[1, 2.6, 1.1], hspace=0.65)
 ax_ref = fig2.add_subplot(gs2[0])
 ax_depth = fig2.add_subplot(gs2[1], sharex=ax_ref)
+ax_yield = fig2.add_subplot(gs2[2])
 
 # --- 基準配列（reference）トラック ---
 ax_ref.set_xlim(0, _ref_len)
@@ -544,20 +610,41 @@ acc_line, = ax_acc.plot(
 )
 ax_acc.axhline(0.9, color=ACCENT_COLOR, linestyle=':', linewidth=1.0, alpha=0.3)
 
+# --- Yield / スループット（累積アサイン塩基数の推移） ---
+ax_yield.set_xlabel('time', fontsize=9, color='#888888')
+ax_yield.set_ylabel('yield (bases)', fontsize=9, color='#888888')
+ax_yield.set_facecolor('#0A0A0A')
+ax_yield.grid(True, color=GRID_COLOR, alpha=0.4)
+ax_yield.tick_params(axis='both', labelsize=8, colors='#888888')
+for spine in ax_yield.spines.values():
+    spine.set_color('#333333')
+
+_yield_t_hist = []  # 診断/描画用に時刻を蓄積
+_yield_v_hist = []  # 累積アサイン塩基数を蓄積
+yield_line, = ax_yield.plot(
+    [], [], color='#4FC3F7', linewidth=1.6, alpha=0.9, zorder=3,
+)
+yield_head = ax_yield.scatter([0], [0], s=25, color=ACCENT_COLOR, zorder=4)
+
+# --- 統計ダッシュボード（2段のテキスト行にまとめる） ---
 assembly_status_text = fig2.text(
-    0.02, 0.02, '', fontsize=9, fontfamily=FONT_MONO, color='#AAAAAA', va='bottom', ha='left',
+    0.02, 0.965, '', fontsize=9, fontfamily=FONT_MONO, color='#AAAAAA', va='top', ha='left',
+)
+assembly_status_text2 = fig2.text(
+    0.02, 0.945, '', fontsize=9, fontfamily=FONT_MONO, color='#AAAAAA', va='top', ha='left',
 )
 latest_frag_text = fig2.text(
-    0.98, 0.02, '', fontsize=9, fontfamily=FONT_MONO, color=ACCENT_COLOR, va='bottom', ha='right',
+    0.98, 0.965, '', fontsize=9, fontfamily=FONT_MONO, color=ACCENT_COLOR, va='top', ha='right',
 )
 
-fig2.subplots_adjust(left=0.08, right=0.95, top=0.82, bottom=0.14)
+fig2.subplots_adjust(left=0.09, right=0.93, top=0.88, bottom=0.08)
 
 # アセンブリの状態（フレームをまたいで保持する）
 _next_frag_idx = 0
 _reveal_time = -999.0
 _reveal_frag = None
 _frag_reveal_decay = 1.2  # ハイライトが消えるまでの時間幅
+_cumulative_yield = 0     # Yield計算用: これまでにアサインされた塩基数の累積
 
 # 動的に追加/削除する描画要素をまとめて管理
 dynamic_artists = []
@@ -837,10 +924,11 @@ def update(frame):
     # ============================
     # アセンブリパネル（別ウインドウ fig2）の更新
     # ============================
-    global _next_frag_idx, _reveal_time, _reveal_frag
+    global _next_frag_idx, _reveal_time, _reveal_frag, _cumulative_yield
 
     while _next_frag_idx < n_frag and frag_end_times[_next_frag_idx] <= playhead_t:
         frag = fragments[_next_frag_idx]
+        _cumulative_yield += frag['length']
         if frag['align_start'] is not None:
             depth_counts[frag['align_start']:frag['align_end']] += 1
             for _pos, _conf in frag['pos_conf']:
@@ -860,6 +948,41 @@ def update(frame):
     acc_y = np.where(covered, consensus_accuracy, np.nan)
     acc_line.set_data(acc_x, acc_y)
     mean_accuracy = float(consensus_accuracy[covered].mean()) if covered.any() else 0.0
+    mean_q = _prob_to_qscore(mean_accuracy) if mean_accuracy > 0 else 0.0
+
+    # --- Depthの均一性（変動係数 CV = 標準偏差 / 平均。小さいほどムラが少ない） ---
+    if covered.sum() >= 2:
+        _d = depth_counts[covered]
+        depth_cv = float(_d.std() / _d.mean())
+    else:
+        depth_cv = 0.0
+
+    # --- N50（読み取り断片の長さの代表値） ---
+    _lengths = np.array([f['length'] for f in fragments[:_next_frag_idx]])
+    if len(_lengths) > 0:
+        _sorted_len = np.sort(_lengths)[::-1]
+        _cum = np.cumsum(_sorted_len)
+        _half = _cum[-1] / 2.0
+        n50 = int(_sorted_len[np.searchsorted(_cum, _half)])
+    else:
+        n50 = 0
+
+    # --- Pass率（PASS_Q_THRESHOLDを超えたリードの割合） ---
+    _confs = np.array([
+        f['mean_conf'] for f in fragments[:_next_frag_idx] if not np.isnan(f['mean_conf'])
+    ])
+    if len(_confs) > 0:
+        pass_rate = float((_confs >= PASS_CONF_THRESHOLD).mean()) * 100
+    else:
+        pass_rate = 0.0
+
+    # --- Yield / スループット（時間 vs 累積アサイン塩基数） ---
+    _yield_t_hist.append(playhead_t)
+    _yield_v_hist.append(_cumulative_yield)
+    yield_line.set_data(_yield_t_hist, _yield_v_hist)
+    ax_yield.set_xlim(0, max(playhead_t * 1.05, 1e-3))
+    ax_yield.set_ylim(0, max(_cumulative_yield * 1.15, 5))
+    yield_head.set_offsets([[playhead_t, _cumulative_yield]])
 
     if _reveal_frag is not None:
         age = playhead_t - _reveal_time
@@ -877,7 +1000,13 @@ def update(frame):
     assembly_status_text.set_text(
         f"reads assembled: {_next_frag_idx} / {n_frag}   "
         f"total depth: {int(depth_counts.sum())}   "
-        f"mean accuracy: {mean_accuracy * 100:5.1f}%"
+        f"yield: {_cumulative_yield} bases"
+    )
+    assembly_status_text2.set_text(
+        f"mean accuracy: {mean_accuracy * 100:5.1f}%  (Q{mean_q:4.1f})   "
+        f"N50: {n50}   "
+        f"depth CV: {depth_cv:.2f}   "
+        f"pass rate (\u2265Q{PASS_Q_THRESHOLD:.0f}): {pass_rate:5.1f}%"
     )
 
     fig2.canvas.draw_idle()
@@ -889,7 +1018,7 @@ def update(frame):
         + [marker_glow, marker_ring, marker_core, scan_caret]
         + dynamic_artists + trail_artists
         + prob_bars + [prob_glow] + prob_name_labels + prob_pct_labels
-        + [acc_line]
+        + [acc_line, yield_line, yield_head]
     )
 
 
