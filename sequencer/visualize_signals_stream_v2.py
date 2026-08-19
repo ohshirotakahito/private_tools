@@ -32,7 +32,10 @@ ACCENT_COLOR = '#39FF14'      # 再生ヘッドなどのネオン色
 GRID_COLOR = '#333333'
 FONT_MONO = 'DejaVu Sans Mono'
 
-save_dir = Path('seq_data')
+# スクリプト自身の場所を基準にする（どのディレクトリから実行しても動くように）
+BASE_DIR = Path(__file__).resolve().parent
+
+save_dir = BASE_DIR / 'seq_data'
 manifest_path = save_dir / 'manifest.csv'
 
 if not manifest_path.exists():
@@ -50,7 +53,7 @@ print(f"{len(manifest_df)} 件のデータを連結してアニメーション�
 # BC CSVからコードの色・名前情報を読み込む
 # ============================
 def load_code_info(selectBC):
-    file_path = Path('BC') / f'{selectBC}.csv'
+    file_path = BASE_DIR / 'BC' / f'{selectBC}.csv'
     df = pd.read_csv(
         file_path,
         names=["Index", "Code", "Name", "Colar", "R_conductance",

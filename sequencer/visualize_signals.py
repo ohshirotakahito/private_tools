@@ -14,7 +14,10 @@ from pathlib import Path
 import pandas as pd
 import matplotlib.pyplot as plt
 
-save_dir = Path('seq_data')
+# スクリプト自身の場所を基準にする（どのディレクトリから実行しても動くように）
+BASE_DIR = Path(__file__).resolve().parent
+
+save_dir = BASE_DIR / 'seq_data'
 manifest_path = save_dir / 'manifest.csv'
 
 if not manifest_path.exists():

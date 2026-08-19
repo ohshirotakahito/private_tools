@@ -23,6 +23,9 @@ import pandas as pd
 
 from signal_formation import g_list, raw_form, datalist
 
+# スクリプト自身の場所を基準にする（どのディレクトリから実行しても動くように）
+BASE_DIR = Path(__file__).resolve().parent
+
 
 def assigned_form_with_codes(sequence, values):
     """assigned_form と同じロジックだが、各時点の元コード(文字)も一緒に返す版。"""
@@ -59,7 +62,7 @@ noise_amplitude = 0.10
 drift_strength = 0.002
 signal_dependent_noise = False
 
-save_dir = Path('seq_data')
+save_dir = BASE_DIR / 'seq_data'
 save_dir.mkdir(exist_ok=True)
 
 values_lookup = datalist(selectBC)  # Code -> R_conductance の辞書（1回だけ読み込み）

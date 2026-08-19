@@ -12,10 +12,13 @@ import random
 import datetime
 from pathlib import Path
 
+# スクリプト自身の場所を基準にする（どのディレクトリから実行しても動くように）
+BASE_DIR = Path(__file__).resolve().parent
+
 # データリストを作成する関数
 def datalist(selectBC):
     # 指定されたCSVファイルを読み込む
-    file_path = Path('BC/'+ selectBC +'.csv')
+    file_path = BASE_DIR / 'BC' / f'{selectBC}.csv'
 
     if not file_path.exists():
         raise FileNotFoundError(f"CSVファイルが見つかりません: {file_path}")
@@ -313,7 +316,7 @@ if __name__ == '__main__':
     
     # プロットデータをCSVファイルとして保存
     # ランダムに生成されたデータをCSV形式で保存
-    save_dir = Path('seq_data')
+    save_dir = BASE_DIR / 'seq_data'
     save_dir.mkdir(exist_ok=True)
 
     plot_csv_file_path = save_dir / f'{sequence}_{current_time_str}_plot_data.csv'
