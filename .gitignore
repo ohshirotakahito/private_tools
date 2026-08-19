@@ -20,6 +20,8 @@ results/
 models/i
 cache/
 logs/
+seq_data/
+gif/
 
 # Jupyter
 .ipynb_checkpoints/
