@@ -17,7 +17,7 @@ env/
 # Data and generated outputs
 data/
 results/
-models/
+models/i
 cache/
 logs/
 
@@ -27,3 +27,6 @@ logs/
 # OS files
 .DS_Store
 Thumbs.db
+
+# Git bundle
+*.bundle
