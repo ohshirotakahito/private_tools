@@ -5,8 +5,13 @@
 ## Directory structure
 
 - `src/` : Pythonプログラム本体
+- `sequencer/` : ナノポア型シーケンサー可視化ツール（詳細は [sequencer/README.md](sequencer/README.md) を参照）
 - `tests/` : テストコード
 - `docs/` : 設計・仕様・開発メモ
+
+## Tools
+
+- **sequencer** : シーケンサーの信号読み取り〜アセンブリ過程をリアルタイム可視化する展示会向けツール（Molecule Caller）。詳細は [sequencer/README.md](sequencer/README.md)。
 
 ## Development policy
 
@@ -18,4 +23,4 @@
 
 ## Repository status
 
-This repository is currently managed locally and is not connected to a remote Git repository.
+This repository is tracked on GitHub (`origin/main`).
