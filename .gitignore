@@ -17,10 +17,11 @@ env/
 # Data and generated outputs
 data/
 results/
-models/i
+models/
 cache/
 logs/
 seq_data/
+copy/
 gif/
 
 # Jupyter

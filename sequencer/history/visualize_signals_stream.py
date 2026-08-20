@@ -1,3 +1,12 @@
+# /// script
+# requires-python = ">=3.11"
+# dependencies = [
+#     "matplotlib>=3.11.1",
+#     "numpy>=2.4.6",
+#     "pandas>=3.0.5",
+# ]
+# ///
+
 # -*- coding: utf-8 -*-
 """
 batch_generate.py (Code列対応版) で保存した複数の波形データを、

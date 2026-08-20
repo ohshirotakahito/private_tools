@@ -61,18 +61,9 @@ def assigned_form_with_codes(sequence, values):
 # ============================
 # パラメータ（ここを変更して使う）
 # ============================
-experiment_name = 'Kiyotani'    # 実験名。空文字 '' なら未設定。
-
-sample_name = 'Neoantigen380'             # 試料名。空文字 '' なら未設定。
-
-sequence_name = 'NECTIN3_A381E'  # 配列の呼び名(例: 'vassp@resin', 'osytosine')。空文字 '' なら未設定。
-
 #sequence = "CYFQNCPRG"    # vassp@resin       # 元配列
 #sequence = "CYIQNCPLG" #osytosine
-sequence = 'LETEPKKL'      # 実際の配列(文字列)。BC CSVのCode列に対応する文字で構成する。
-
-sample_name = 'Neoantigen380'             # 試料名。空文字 '' なら未設定。
-experiment_name = 'Kiyotani'    # 実験名。空文字 '' なら未設定。
+sequence = 'SVCAGILSYGV'
 selectBC = 'Amino_01phos'   # BC/{selectBC}.csv を参照
 fn = 1                      # 部分配列の最小長
 sn = 100                    # 1回あたりのシグナル数
@@ -83,32 +74,7 @@ noise_amplitude = 0.05
 drift_strength = 0.002
 signal_dependent_noise = False
 
-save_dir_root = BASE_DIR / 'seq_data'
-save_dir_root.mkdir(exist_ok=True)
-
-
-def _sanitize_for_folder(name):
-    """フォルダ名に使えない文字(空白・スラッシュなど)を安全な文字に置き換える"""
-    keep = "-_."
-    return "".join(c if c.isalnum() or c in keep else "_" for c in str(name)).strip("_")
-
-
-# 配列ごとに散らからないよう、実行ごとに専用のサブフォルダへ保存する。
-# フォルダ名は 実験名 → 試料名 → 配列の呼び名 → 日時 の順。
-# 実際の配列(sequence文字列)は長くなりがちなのでフォルダ名には含めず、
-# manifest.csv 側にだけ記録する。
-#   例: seq_data/exp01_sampleA_sample_seqA_20260820_124127/
-#   すべて空文字なら: seq_data/20260820_124127/
-_batch_timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-_name_parts = [
-    p for p in (
-        _sanitize_for_folder(experiment_name),
-        _sanitize_for_folder(sample_name),
-        _sanitize_for_folder(sequence_name),
-    ) if p
-]
-batch_dir_name = "_".join(_name_parts + [_batch_timestamp])
-save_dir = save_dir_root / batch_dir_name
+save_dir = BASE_DIR / 'seq_data'
 save_dir.mkdir(exist_ok=True)
 
 values_lookup = datalist(selectBC)  # Code -> R_conductance の辞書（1回だけ読み込み）
@@ -145,9 +111,6 @@ for run_idx in range(num_runs):
         'run_idx': run_idx,
         'file_name': file_name,
         'sequence': sequence,
-        'sequence_name': sequence_name,
-        'sample_name': sample_name,
-        'experiment_name': experiment_name,
         'selectBC': selectBC,
         'seed': seed,
         'noise_amplitude': noise_amplitude,
@@ -162,12 +125,5 @@ manifest_df = pd.DataFrame(manifest_rows)
 manifest_path = save_dir / 'manifest.csv'
 manifest_df.to_csv(manifest_path, index=False)
 
-# 可視化スクリプト(sequence_stream_pyqtgraph.py)が、何も設定しなくても
-# 自動的にこのバッチを読みに行けるよう、「最新バッチ」を指すポインタを書いておく。
-# 過去のバッチを見たいときは、可視化スクリプト側の BATCH_DIR_OVERRIDE に
-# batch_dir_name をそのまま指定すれば切り替えられる。
-(save_dir_root / '_latest_batch.txt').write_text(batch_dir_name, encoding='utf-8')
-
 print(f"\n{num_runs} 件の波形データを生成しました。")
-print(f"保存先フォルダ: {save_dir}")
 print(f"マニフェストを保存しました: {manifest_path}")
