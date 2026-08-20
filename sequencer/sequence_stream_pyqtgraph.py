@@ -69,6 +69,21 @@ FS_STATUS = 11
 
 pg.setConfigOptions(antialias=True, background=BG_COLOR, foreground="#CCCCCC")
 
+# ============================
+# ダッシュボード配色パレット(参考画像のネイビー系デザインに合わせる)
+# ※ CSVから読み込むコード別カラー(load_code_info)がこのパレットの
+#   背景色と衝突(=見分けがつかない)しないかを判定するために、
+#   コード配色を読み込むより前でここに定義しておく。
+# ============================
+PAGE_BG = "#0B1220"
+SIDEBAR_BG = "#0D1526"
+CARD_BG = "#101A2E"
+CARD_BORDER = "#1E2A44"
+TEXT_PRIMARY = "#E7ECF5"
+TEXT_MUTED = "#8592AC"
+ACCENT_BLUE = "#38BDF8"
+GREEN_OK = "#4ADE80"
+
 
 # ============================
 # PyQt5 / PyQt6 互換レイヤー
@@ -122,12 +137,65 @@ except AttributeError:
 # ============================
 # 汎用ユーティリティ(matplotlib非依存。元スクリプトから移植)
 # ============================
+def _hex_to_rgb(hex_color):
+    """'#RRGGBB' (前後に余分な桁が付いていても末尾6桁をRGBとみなす)をRGBタプルに変換する。
+
+    CSV由来の色コードは上位バイトにアルファ値が乗っている等の理由で
+    24bit(6桁)を超えることがある。素直に先頭6桁を読むとチャンネルが
+    ズレて全く別の(暗い)色になってしまうため、必ず「下位6桁 = RGB」
+    として扱う。桁が6未満の場合は0埋めする。
+    """
+    hex_color = hex_color.lstrip("#")
+    hex_color = hex_color[-6:].rjust(6, "0")
+    return int(hex_color[0:2], 16), int(hex_color[2:4], 16), int(hex_color[4:6], 16)
+
+
 def contrasting_text_color(hex_color):
     """背景色の明るさに応じて、読みやすい文字色(黒or白)を返す"""
-    hex_color = hex_color.lstrip("#")
-    r, g, b = int(hex_color[0:2], 16), int(hex_color[2:4], 16), int(hex_color[4:6], 16)
+    r, g, b = _hex_to_rgb(hex_color)
     luminance = 0.299 * r + 0.587 * g + 0.114 * b
     return "#000000" if luminance > 140 else "#FFFFFF"
+
+
+def _relative_luminance(r, g, b):
+    """WCAGの相対輝度(0-1)。コントラスト比の計算に使う。"""
+    def _lin(c):
+        c = c / 255.0
+        return c / 12.92 if c <= 0.03928 else ((c + 0.055) / 1.055) ** 2.4
+    return 0.2126 * _lin(r) + 0.7152 * _lin(g) + 0.0722 * _lin(b)
+
+
+def _contrast_ratio(hex_a, hex_b):
+    la = _relative_luminance(*_hex_to_rgb(hex_a))
+    lb = _relative_luminance(*_hex_to_rgb(hex_b))
+    lighter, darker = max(la, lb), min(la, lb)
+    return (lighter + 0.05) / (darker + 0.05)
+
+
+def ensure_visible_on_bg(hex_color, bg_hex, min_contrast=2.2):
+    """背景色(パネル/カード背景)と見分けがつかないほど暗い色を、
+    最低限のコントラスト比を満たすまで明るく持ち上げて返す。
+
+    同じ色相のまま明度(V)だけ上げていくので、色自体の見た目
+    (何のアミノ酸かを示す配色)はできるだけ保つ。
+    """
+    import colorsys
+
+    r, g, b = _hex_to_rgb(hex_color)
+    if _contrast_ratio(hex_color, bg_hex) >= min_contrast:
+        return "#{:02X}{:02X}{:02X}".format(r, g, b)
+
+    h, s, v = colorsys.rgb_to_hsv(r / 255.0, g / 255.0, b / 255.0)
+    for _ in range(40):
+        if v >= 1.0:
+            break
+        v = min(1.0, v + 0.03)
+        s = max(0.35, s * 0.985)  # 明るくしすぎて白飛びしないよう彩度も少しだけ保持
+        r, g, b = (int(round(c * 255)) for c in colorsys.hsv_to_rgb(h, s, v))
+        candidate = "#{:02X}{:02X}{:02X}".format(r, g, b)
+        if _contrast_ratio(candidate, bg_hex) >= min_contrast:
+            return candidate
+    return "#{:02X}{:02X}{:02X}".format(r, g, b)
 
 
 def _logit(p, eps=1e-3):
@@ -357,7 +425,17 @@ def load_code_info(selectBC):
     )
     info = {}
     for _, row in df.iterrows():
-        hex_color = "#{:06X}".format(int(row["Colar"]))
+        # "Colar" が24bit(0xFFFFFF)を超える値(上位バイトにアルファ値が
+        # 乗っているなど)を持っていると、素直に "{:06X}" で文字列化した
+        # 際に7桁以上になり、後段でRGBチャンネルがズレて意図しない
+        # (結果的にほぼ黒に見える)色になってしまう。下位24bitだけを
+        # RGBとして使うことでこれを防ぐ。
+        hex_color = "#{:06X}".format(int(row["Colar"]) & 0xFFFFFF)
+        # 背景色(カード/パネル)と見分けがつかないほど暗い色は、
+        # 見た目の色相を保ったまま自動的に明るく補正しておく
+        # (例: F の配色がカード背景の紺色と同化して文字が見えなくなる問題)。
+        hex_color = ensure_visible_on_bg(hex_color, CARD_BG)
+        hex_color = ensure_visible_on_bg(hex_color, PANEL_BG)
         info[row["Code"]] = {
             "name": row["Name"] if isinstance(row["Name"], str) else str(row["Code"]),
             "color": hex_color,
@@ -661,19 +739,6 @@ def make_kpi_card(parent_layout, label, accent=ACCENT_COLOR2, value_fs=18):
 
     parent_layout.addWidget(frame)
     return val
-
-
-# ============================
-# ダッシュボード配色パレット(参考画像のネイビー系デザインに合わせる)
-# ============================
-PAGE_BG = "#0B1220"
-SIDEBAR_BG = "#0D1526"
-CARD_BG = "#101A2E"
-CARD_BORDER = "#1E2A44"
-TEXT_PRIMARY = "#E7ECF5"
-TEXT_MUTED = "#8592AC"
-ACCENT_BLUE = "#38BDF8"
-GREEN_OK = "#4ADE80"
 
 
 class HBar(QtWidgets.QWidget):
@@ -1941,11 +2006,14 @@ class DashboardWindow(QtWidgets.QMainWindow):
             pct_lbl.setText(f"{p * 100:.1f}%")
 
         # --- アセンブリ(depth / consensus / yield) ---
+        _prev_next_frag_idx = self.next_frag_idx
+        _touched_positions = set()
         while self.next_frag_idx < n_frag and frag_end_times[self.next_frag_idx] <= playhead_t:
             frag = fragments[self.next_frag_idx]
             self.cumulative_yield += frag["length"]
             if frag["align_start"] is not None:
                 self.depth_counts[frag["align_start"]:frag["align_end"]] += 1
+                _touched_positions.update(range(frag["align_start"], frag["align_end"]))
                 for _pos, _conf in frag["pos_conf"]:
                     if not np.isnan(_conf):
                         self.depth_logodds[_pos] += _logit(_conf)
@@ -1956,12 +2024,19 @@ class DashboardWindow(QtWidgets.QMainWindow):
 
         covered = self.depth_counts > 0
         consensus_accuracy = _sigmoid(self.depth_logodds)
-        for pi in range(_ref_len):
-            peak = float(consensus_accuracy[pi]) if covered[pi] else 0.0
-            wy = peak * self._gauss_kernel
-            self.acc_wave_lines[pi].setData(self.acc_wave_lines[pi].xData, wy)
+        # 新しいフラグメントが確定してカバレッジ/信頼度が実際に変わった位置
+        # だけを再描画する。毎フレーム _ref_len 個すべての PlotDataItem を
+        # setData()し直すと(反映される値が変わっていなくても)UIスレッドが
+        # 詰まり、Windowsで「応答なし」表示が出る主因になっていたため、
+        # ここで差分更新に変更している。
+        if self.next_frag_idx != _prev_next_frag_idx:
+            for pi in _touched_positions:
+                peak = float(consensus_accuracy[pi]) if covered[pi] else 0.0
+                wy = peak * self._gauss_kernel
+                self.acc_wave_lines[pi].setData(self.acc_wave_lines[pi].xData, wy)
         mean_accuracy = float(consensus_accuracy[covered].mean()) if covered.any() else 0.0
         mean_q = _prob_to_qscore(mean_accuracy) if mean_accuracy > 0 else 0.0
+
 
         # --- Mean consensus accuracy 表示(値・バー・Phred Q・トレンド矢印) ---
         if mean_accuracy >= 0.99:

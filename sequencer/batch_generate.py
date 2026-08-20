@@ -61,18 +61,16 @@ def assigned_form_with_codes(sequence, values):
 # ============================
 # パラメータ（ここを変更して使う）
 # ============================
-experiment_name = 'Kiyotani'    # 実験名。空文字 '' なら未設定。
+experiment_name = 'Tsuzikawa'    # 実験名。空文字 '' なら未設定。
 
-sample_name = 'Neoantigen380'             # 試料名。空文字 '' なら未設定。
+sample_name = 'VHH'             # 試料名。空文字 '' なら未設定。
 
-sequence_name = 'NECTIN3_A381E'  # 配列の呼び名(例: 'vassp@resin', 'osytosine')。空文字 '' なら未設定。
+sequence_name = 'VHH_spt50_001'  # 配列の呼び名(例: 'vassp@resin', 'osytosine')。空文字 '' なら未設定。
 
 #sequence = "CYFQNCPRG"    # vassp@resin       # 元配列
 #sequence = "CYIQNCPLG" #osytosine
-sequence = 'LETEPKKL'      # 実際の配列(文字列)。BC CSVのCode列に対応する文字で構成する。
+sequence = 'PAYTNSFTRGVYYPDKVFRSSVLHSTQDLFLPFFSNVTWFHAIHVSGTNG'      # 実際の配列(文字列)。BC CSVのCode列に対応する文字で構成する。
 
-sample_name = 'Neoantigen380'             # 試料名。空文字 '' なら未設定。
-experiment_name = 'Kiyotani'    # 実験名。空文字 '' なら未設定。
 selectBC = 'Amino_01phos'   # BC/{selectBC}.csv を参照
 fn = 1                      # 部分配列の最小長
 sn = 100                    # 1回あたりのシグナル数
