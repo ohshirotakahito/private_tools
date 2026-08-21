@@ -1,0 +1,2 @@
+n_files,total_tp,total_fp,total_fn,total_fn_merged_or_partial,total_fn_not_detected_at_all,mean_precision,mean_recall,mean_f1,mean_baseline_bias,mean_expected_baseline_bias,mean_baseline_rmse,mean_start_time_mae_ms,mean_end_time_mae_ms,mean_peak_height_mae,micro_precision,micro_recall,micro_f1
+100,9296,12,704,2,702,0.9987264215071913,0.9295999999999998,0.962713727022541,0.03341004755599167,0.06415736871966761,0.06108653030184591,0.10178497385097696,0.0028756217364674045,0.06286177592493944,0.9987107864202837,0.9296,0.9629169256266832

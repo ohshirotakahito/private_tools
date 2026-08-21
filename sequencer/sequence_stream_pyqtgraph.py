@@ -133,6 +133,17 @@ try:
 except AttributeError:
     _DIALOG_ACCEPTED = QtWidgets.QDialog.Accepted
 
+try:
+    _PAL_BUTTON = QtGui.QPalette.ColorRole.Button
+    _PAL_BUTTON_TEXT = QtGui.QPalette.ColorRole.ButtonText
+    _PAL_WINDOW = QtGui.QPalette.ColorRole.Window
+    _PAL_WINDOW_TEXT = QtGui.QPalette.ColorRole.WindowText
+except AttributeError:
+    _PAL_BUTTON = QtGui.QPalette.Button
+    _PAL_BUTTON_TEXT = QtGui.QPalette.ButtonText
+    _PAL_WINDOW = QtGui.QPalette.Window
+    _PAL_WINDOW_TEXT = QtGui.QPalette.WindowText
+
 
 # ============================
 # 汎用ユーティリティ(matplotlib非依存。元スクリプトから移植)
@@ -1654,8 +1665,8 @@ class DashboardWindow(QtWidgets.QMainWindow):
         h.addWidget(right_glw, stretch=1)
         self.plot_yield = right_glw.addPlot()
         self.plot_yield.setLabel("bottom", "Time (min)")
-        self.plot_yield.setLabel("left", "Yield (bases)")
-        self.plot_yield.setTitle("Yield (bases)", color=TEXT_MUTED, size="9pt")
+        self.plot_yield.setLabel("left", "Yield (molecules)")
+        self.plot_yield.setTitle("Yield (molecules)", color=TEXT_MUTED, size="9pt")
         for ax_name in ("left", "bottom"):
             axo = self.plot_yield.getAxis(ax_name)
             axo.setPen(pg.mkPen(CARD_BORDER))
@@ -1734,6 +1745,14 @@ class DashboardWindow(QtWidgets.QMainWindow):
         self.pause_btn.setText("\u25B6  Resume" if self._paused else "\u23F8  Pause")
 
     def _stop(self):
+        # ダイアログ表示中もQTimerは動き続け、裏で波形が更新され続けてしまう
+        # (モーダルダイアログはイベントループを止めるだけで、QTimerのイベント
+        # 自体は処理されてしまうため)。確認中は明示的にタイマーを止めておき、
+        # 「No」でキャンセルした場合のみ、元々動いていた場合に限り再開する。
+        was_running = (self.timer is not None) and (not self._paused) and self.timer.isActive()
+        if was_running:
+            self.timer.stop()
+
         box = QtWidgets.QMessageBox(self)
         box.setWindowTitle("Stop")
         box.setText("End the analysis and quit the app?")
@@ -1752,8 +1771,23 @@ class DashboardWindow(QtWidgets.QMainWindow):
             QPushButton:hover {{ background-color:#182842; }}
             QPushButton:default {{ border:1px solid {ACCENT_BLUE}; color:{ACCENT_BLUE}; }}
         """)
+        # QSSだけだとWindowsのネイティブテーマ(PCごとの配色設定)によっては
+        # ボタン文字色が上書きされてしまうことがある。QPaletteはスタイル側の
+        # 実装に関わらず必ず使われる色そのものなので、二重に明示指定して
+        # 「ボタンの文字が背景と同化して見えない」事態を確実に防ぐ。
+        pal = QtGui.QPalette()
+        pal.setColor(_PAL_WINDOW, QtGui.QColor(CARD_BG))
+        pal.setColor(_PAL_WINDOW_TEXT, QtGui.QColor(TEXT_PRIMARY))
+        pal.setColor(_PAL_BUTTON, QtGui.QColor(CARD_BG))
+        pal.setColor(_PAL_BUTTON_TEXT, QtGui.QColor(TEXT_PRIMARY))
+        box.setPalette(pal)
+        for btn in box.buttons():
+            btn.setPalette(pal)
+
         reply = box.exec()
         if reply != _MSGBOX_YES:
+            if was_running:
+                self.timer.start(interval_ms)
             return
         if self.timer is not None:
             self.timer.stop()
@@ -2098,7 +2132,7 @@ class DashboardWindow(QtWidgets.QMainWindow):
 
         self.kpi_reads_val.setText(f"{self.next_frag_idx:,} / {n_frag:,}")
         self.kpi_reads_sub.setText(f"{self.next_frag_idx / max(n_frag, 1) * 100:.1f}% of target")
-        self.kpi_yield_val.setText(f"{self.cumulative_yield} bp")
+        self.kpi_yield_val.setText(f"{self.cumulative_yield} molecules")
         self.kpi_yield_sub.setText("Live yield")
         self.kpi_q_val.setText(f"{mean_q:.1f}")
         self.kpi_q_sub.setText("Phred quality score")
@@ -2108,6 +2142,14 @@ class DashboardWindow(QtWidgets.QMainWindow):
 
 def main():
     app = QtWidgets.QApplication(sys.argv)
+    # Windowsのネイティブスタイル(windowsvista/windows11)は、QMessageBoxや
+    # QPushButtonの文字色などQSSの一部プロパティをOS側のテーマ設定に応じて
+    # 上書きしてしまうことがある。そのため同じスタイルシートでも、Windowsの
+    # テーマ/配色設定が違うPC間で見え方が変わり(例: Stop確認ポップアップの
+    # ボタン文字が背景色と同化して見えなくなる)、機種依存の表示崩れの原因に
+    # なる。Fusionスタイルは全てQt自身が描画するため、QSSで指定した色が
+    # どのPC/どのWindowsテーマでも一貫して適用される。
+    app.setStyle(QtWidgets.QStyleFactory.create("Fusion"))
     win = DashboardWindow()
     win.show()
 
