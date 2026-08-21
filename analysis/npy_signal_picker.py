@@ -66,7 +66,7 @@ import matplotlib.pyplot as plt
 from matplotlib.widgets import Button, CheckButtons, RangeSlider, Slider
 from matplotlib.patches import FancyBboxPatch, Rectangle
 from scipy.signal import savgol_filter
-from scipy.ndimage import percentile_filter
+from scipy.ndimage import percentile_filter, label, find_objects
 from pathlib import Path
 from datetime import datetime
 
@@ -203,71 +203,61 @@ def detect_pulses_hysteresis(y, baseline_curve, noise, dt=DT,
     y = np.asarray(y)
     n = len(y)
     if n == 0:
-        return []
+        t1_curve = baseline_curve + threshold_k1 * noise
+        t2_curve = baseline_curve + threshold_k2 * noise
+        return [], t1_curve, t2_curve
 
     t1_curve = baseline_curve + threshold_k1 * noise
     t2_curve = baseline_curve + threshold_k2 * noise
 
+    # above_t1 の連続領域（候補）をラベリングして、各領域ごとに
+    # above_t2 が一度でも真になっているかで確定判定をする。
+    above_t1 = y > t1_curve
     pulses = []
-    state = "IDLE"       # IDLE -> CANDIDATE -> CONFIRMED -> IDLE
-    cand_start = None
 
-    def _finalize(start, end):
+    if not np.any(above_t1):
+        return pulses, t1_curve, t2_curve
+
+    labeled, nlabels = label(above_t1)
+    objs = find_objects(labeled)
+
+    for obj in objs:
+        if obj is None:
+            continue
+        a = obj[0].start
+        b = obj[0].stop  # b は exclusive
+
+        # 元実装の挙動を模倣: 開始点は一つ前のサンプルを含める
+        start = a - 1 if a > 0 else a
+        end = b
+
+        # 確定条件: 区間内に t2 を超えたサンプルが存在すること
+        if not np.any(y[a:b] > t2_curve[a:b]):
+            continue
+
         width_ms = (end - start) * dt * 1000
         if width_ms < min_width_ms:
-            return None
+            continue
+
         segment = y[start:end]
         local_baseline = float(baseline_curve[start])
-        return {
-            "start_index": start,
-            "end_index": end,
-            "start_time_s": start * dt,
-            "end_time_s": end * dt,
-            "width_ms": width_ms,
-            "peak": float(np.max(segment)),
-            "mean": float(np.mean(segment)),
-            "area": float(np.sum(segment - local_baseline) * dt),
+        peak = float(np.max(segment))
+        mean = float(np.mean(segment))
+        area = float(np.sum(segment - local_baseline) * dt)
+
+        pulses.append({
+            "start_index": int(start),
+            "end_index": int(end),
+            "start_time_s": float(start * dt),
+            "end_time_s": float(end * dt),
+            "width_ms": float(width_ms),
+            "peak": peak,
+            "mean": mean,
+            "area": area,
             "baseline": local_baseline,
             "threshold_t1": float(t1_curve[start]),
             "threshold_t2": float(t2_curve[start]),
-        }
-
-    for i in range(n):
-        yi = y[i]
-        t1 = t1_curve[i]
-        t2 = t2_curve[i]
-
-        if state == "IDLE":
-            if yi > t1:
-                state = "CANDIDATE"
-                # 開始点は「t1を超えた最初のサンプル」ではなく、
-                # 「t1を超える直前(まだt1以下)の1つ前のサンプル」とする。
-                # 立ち上がりが急峻なデータでは、超えた最初のサンプルが
-                # 既にピーク付近まで跳ね上がっていることが多く、
-                # 開始点がt1のラインよりずっと高く見えてしまうため。
-                cand_start = i - 1 if i > 0 else i
-
-        elif state == "CANDIDATE":
-            if yi > t2:
-                state = "CONFIRMED"          # ② 確定
-            elif yi <= t1:
-                state = "IDLE"               # t2に届かず終わった候補 -> 破棄
-                cand_start = None
-
-        elif state == "CONFIRMED":
-            if yi <= t1:                     # ④ 終了
-                p = _finalize(cand_start, i)
-                if p is not None:
-                    pulses.append(p)
-                state = "IDLE"
-                cand_start = None
-            # yi<=t2 (③)でも yi>t1 である限りは CONFIRMED のまま継続
-
-    # ファイル終端で CONFIRMED のまま終わった場合、そこまでを1パルスとして確定する
-    if state == "CONFIRMED" and cand_start is not None:
-        p = _finalize(cand_start, n)
-        if p is not None:
-            pulses.append(p)
+        })
 
     return pulses, t1_curve, t2_curve
 
@@ -290,6 +280,9 @@ class NpySignalPicker:
         self.out_csv = out_csv
         self.initial_view_width = float(initial_view_width)
         self.exclude_edge_pulses = bool(exclude_edge_pulses)
+        # キャッシュ: キー=(path_str, mtime, length, baseline_window, baseline_percentile, sg_window, sg_poly)
+        # 値={'baseline': array, 'std': float}
+        self._baseline_cache = {}
         # ベースライン推定のパラメータ（スライダーで調整可能にする）
         self.baseline_window = BASELINE_WINDOW          # サンプル数（奇数）
         self.baseline_percentile = float(BASELINE_PERCENTILE)
@@ -323,7 +316,7 @@ class NpySignalPicker:
         self.show_pulse = True
         self.show_peak_value = True
 
-        self.fig, self.ax = plt.subplots(figsize=(17, 10.5))
+        self.fig, self.ax = plt.subplots(figsize=(12, 7.5))
         plt.subplots_adjust(left=0.13, right=0.70, bottom=0.34, top=0.94)
 
         # 右側: 表示範囲内のパルス一覧表（＋縦スクロールバー）
@@ -353,12 +346,21 @@ class NpySignalPicker:
         )
         self.check.on_clicked(self.on_check)
 
-        # 表示範囲スライダー（ファイルごとに作り直す）
-        self.ax_slider = plt.axes([0.18, 0.28, 0.65, 0.03])
-        self.range_slider = None
+        # 表ポップアウト & 表示範囲評価ボタン（簡易配置）
+        ax_show_table = plt.axes([0.01, 0.49, 0.11, 0.04])
+        self.btn_show_table = Button(ax_show_table, "Show Table")
+        self.btn_show_table.on_clicked(self.on_show_table)
+
+        ax_eval_view = plt.axes([0.01, 0.44, 0.11, 0.04])
+        self.btn_eval_view = Button(ax_eval_view, "Evaluate View")
+        self.btn_eval_view.on_clicked(self.on_evaluate_view)
+
+        # 表示範囲スライダーはファイルごとに作り直す（ウィンドウサイズと開始位置の2スライダ）
+        self.window_size_slider = None
+        self.window_start_slider = None
 
         # 閾値スライダー（k1, k2 独立、ファイルをまたいで値を維持する）
-        ax_k1 = plt.axes([0.18, 0.23, 0.65, 0.03])
+        ax_k1 = plt.axes([0.18, 0.20, 0.65, 0.03])
         self.k1_slider = Slider(
             ax_k1, "Threshold k1 (start/end)",
             valmin=THRESHOLD_K_MIN, valmax=THRESHOLD_K_MAX,
@@ -366,7 +368,7 @@ class NpySignalPicker:
         )
         self.k1_slider.on_changed(self.on_k1_change)
 
-        ax_k2 = plt.axes([0.18, 0.18, 0.65, 0.03])
+        ax_k2 = plt.axes([0.18, 0.16, 0.65, 0.03])
         self.k2_slider = Slider(
             ax_k2, "Threshold k2 (confirm)",
             valmin=THRESHOLD_K_MIN, valmax=THRESHOLD_K_MAX,
@@ -376,7 +378,7 @@ class NpySignalPicker:
 
         # ベースライン推定パラメータ（窓幅・パーセンタイル）
         init_window_ms = self.baseline_window * self.dt * 1000
-        ax_bw = plt.axes([0.18, 0.13, 0.65, 0.03])
+        ax_bw = plt.axes([0.18, 0.12, 0.65, 0.03])
         self.bw_slider = Slider(
             ax_bw, "Baseline window (ms)",
             valmin=BASELINE_WINDOW_MS_MIN, valmax=BASELINE_WINDOW_MS_MAX,
@@ -464,32 +466,80 @@ class NpySignalPicker:
     # ----- view range slider -----
 
     def create_view_slider(self, total_duration):
-        self.ax_slider.clear()
+        # ウィンドウサイズ(表示幅) と ウィンドウ開始位置 の2スライダを生成
         total_duration = max(total_duration, 1e-6)
         init_width = min(self.initial_view_width, total_duration)
+        # 以前のスライダがあれば軸を削除してから作り直す
+        try:
+            if self.window_size_slider is not None:
+                self.window_size_slider.ax.remove()
+        except Exception:
+            pass
+        try:
+            if self.window_start_slider is not None:
+                self.window_start_slider.ax.remove()
+        except Exception:
+            pass
 
-        self.range_slider = RangeSlider(
-            self.ax_slider, "View range (s)",
-            valmin=0.0, valmax=total_duration,
-            valinit=(0.0, init_width),
+        ax_size = plt.axes([0.18, 0.28, 0.65, 0.03])
+        self.window_size_slider = Slider(
+            ax_size, "Window size (s)",
+            valmin=DT, valmax=total_duration, valinit=init_width, valstep=DT,
         )
-        self.range_slider.on_changed(self.on_view_change)
+        self.window_size_slider.on_changed(self.on_window_size_change)
+
+        ax_start = plt.axes([0.18, 0.24, 0.65, 0.03])
+        max_start = max(0.0, total_duration - init_width)
+        self.window_start_slider = Slider(
+            ax_start, "Window start (s)",
+            valmin=0.0, valmax=max_start, valinit=0.0, valstep=DT,
+        )
+        self.window_start_slider.on_changed(self.on_window_start_change)
 
     def on_view_change(self, val):
         view_start, view_end = val
         self.update_view(view_start, view_end)
 
     def on_reset_view(self, event):
-        if self.range_slider is None:
+        # Reset view to start=0, size=initial or total_duration
+        if self.window_size_slider is None or self.window_start_slider is None:
             return
-        total_duration = self.range_slider.valmax
-        self.range_slider.set_val((0.0, total_duration))
+        total_duration = self.window_size_slider.valmax
+        init_width = min(self.initial_view_width, total_duration)
+        self.window_size_slider.set_val(init_width)
+        self.window_start_slider.set_val(0.0)
 
     def current_view_range(self):
-        if self.range_slider is not None:
-            return self.range_slider.val
+        if self.window_size_slider is not None and self.window_start_slider is not None:
+            start = float(self.window_start_slider.val)
+            size = float(self.window_size_slider.val)
+            return start, min(start + size, self.window_size_slider.valmax)
         n = len(self.y)
         return 0.0, n * self.dt
+
+    def on_window_size_change(self, val):
+        # ウィンドウサイズが変わったら開始スライダの上限を調整し、ビュー更新
+        if self.window_start_slider is None:
+            return
+        total = self.window_size_slider.valmax
+        size = float(val)
+        # update start slider max
+        new_max = max(0.0, total - size)
+        # recreate start slider axis range by setting valmax attribute
+        try:
+            self.window_start_slider.ax.set_xlim(0.0, new_max)
+        except Exception:
+            pass
+        # clamp start value
+        if self.window_start_slider.val > new_max:
+            self.window_start_slider.set_val(new_max)
+
+        view_start, view_end = self.current_view_range()
+        self.update_view(view_start, view_end)
+
+    def on_window_start_change(self, val):
+        view_start, view_end = self.current_view_range()
+        self.update_view(view_start, view_end)
 
     # ----- threshold sliders -----
 
@@ -543,11 +593,8 @@ class NpySignalPicker:
             return
 
         t = np.arange(n) * self.dt
-        baseline_curve = compute_baseline_curve(
-            y, baseline_window=self.baseline_window,
-            baseline_percentile=self.baseline_percentile,
-        )
-        _, std = robust_baseline_and_std(y)
+        path = self.current_path()
+        baseline_curve, std = self._get_baseline_and_std(y, path)
         pulses, t1_curve, t2_curve = detect_pulses_hysteresis(
             y, baseline_curve, std, dt=self.dt,
             threshold_k1=self.threshold_k1, threshold_k2=self.threshold_k2,
@@ -561,6 +608,38 @@ class NpySignalPicker:
         self.t2_curve = t2_curve
         self.pulses = pulses
         self.std = std
+
+    def _get_baseline_and_std(self, y, path):
+        """ベースライン曲線とノイズ標準偏差をキャッシュ付きで取得する。
+
+        キャッシュキーはファイルパス・mtime・長さ・ベースライン関連パラメータで構成。
+        """
+        p = Path(path)
+        try:
+            mtime = p.stat().st_mtime
+        except Exception:
+            mtime = None
+
+        key = (str(path), mtime, len(y), int(self.baseline_window), float(self.baseline_percentile), SG_WINDOW, SG_POLY)
+        cached = self._baseline_cache.get(key)
+        if cached is not None:
+            return cached["baseline"], cached["std"]
+
+        baseline_curve = compute_baseline_curve(
+            y, baseline_window=self.baseline_window,
+            baseline_percentile=self.baseline_percentile,
+            sg_window=SG_WINDOW, sg_poly=SG_POLY,
+        )
+        _, std = robust_baseline_and_std(y)
+
+        # キャッシュ保存
+        try:
+            # keep a reference to arrays
+            self._baseline_cache[key] = {"baseline": baseline_curve, "std": std}
+        except Exception:
+            pass
+
+        return baseline_curve, std
 
     def redraw_plot(self):
         """信号/ベースライン/閾値の線を描き直す（パルス注釈は含まない）。"""
@@ -594,6 +673,12 @@ class NpySignalPicker:
 
         self.ax.text(0.01, 0.99, str(path), transform=self.ax.transAxes,
                      fontsize=8, va="top", bbox=dict(boxstyle="round", alpha=0.2))
+        # 出力CSVパスを表示
+        try:
+            self.ax.text(0.01, 0.94, f"Out CSV: {self.out_csv}", transform=self.ax.transAxes,
+                         fontsize=8, va="top", bbox=dict(boxstyle="round", alpha=0.15))
+        except Exception:
+            pass
 
         duration = self.t[-1] + self.dt if len(self.t) else 0.0
         margin = self.edge_margin_s
@@ -618,7 +703,7 @@ class NpySignalPicker:
         total_duration = len(self.y) * self.dt
         self.create_view_slider(total_duration)
 
-        view_start, view_end = self.range_slider.val
+        view_start, view_end = self.current_view_range()
         self.update_view(view_start, view_end)
 
     def update_view(self, view_start, view_end):
@@ -841,7 +926,9 @@ class NpySignalPicker:
             return
 
         offset = max(0, min(self.table_offset, max(0, n_total - MAX_TABLE_ROWS)))
-        shown = self._last_visible_pulses[offset:offset + MAX_TABLE_ROWS]
+        # inline プレビューは上限6行だけにして重なりを避ける。フル表はポップアウトで表示。
+        preview_rows = 6
+        shown = self._last_visible_pulses[offset:offset + min(preview_rows, MAX_TABLE_ROWS)]
 
         col_labels = ["Start\n(ms)", "Peak\n(ms)", "End\n(ms)", "Duration\n(ms)",
                      "Peak\n(abs)", "Δ\n(rel)", "σ\n(noise)"]
@@ -872,12 +959,12 @@ class NpySignalPicker:
             loc="upper center", cellLoc="center",
         )
         table.auto_set_font_size(False)
-        table.set_fontsize(8)
-        table.scale(1.0, 1.4)
+        table.set_fontsize(7)
+        table.scale(1.0, 1.2)
 
-        title = f"Pulses in view: {n_total}"
-        if n_total > MAX_TABLE_ROWS:
-            title += f"  (showing {offset+1}-{offset+len(shown)})"
+        title = f"Pulses in view (preview): {n_total}"
+        if n_total > preview_rows:
+            title += f"  (showing 1-{preview_rows}; click 'Show Table')"
         self.ax_table.set_title(title, fontsize=9)
 
     # ----- events -----
@@ -933,11 +1020,7 @@ class NpySignalPicker:
                 print(f"[ERROR] 読み込み失敗: {path}\n  -> {e}")
                 continue
 
-            baseline_curve = compute_baseline_curve(
-                y, baseline_window=self.baseline_window,
-                baseline_percentile=self.baseline_percentile,
-            )
-            _, std = robust_baseline_and_std(y)
+            baseline_curve, std = self._get_baseline_and_std(y, path)
             pulses, _, _ = detect_pulses_hysteresis(
                 y, baseline_curve, std, dt=self.dt,
                 threshold_k1=self.threshold_k1, threshold_k2=self.threshold_k2,
@@ -971,6 +1054,153 @@ class NpySignalPicker:
             plt.close(self.fig)
         except Exception as e:
             print("[ERROR]", e)
+
+    def on_show_table(self, event):
+        """ポップアウトウインドウでフルのパルス表を表示する。"""
+        pulses = self._last_visible_pulses
+        n_total = len(pulses)
+        if n_total == 0:
+            print("[INFO] No pulses in view to show")
+            return
+
+        # 新しい Figure にテーブル表示
+        fig, ax = plt.subplots(figsize=(6, min(0.4 + 0.25 * min(n_total, 40), 12)))
+        ax.axis('off')
+
+        col_labels = ["Start (ms)", "Peak (ms)", "End (ms)", "Duration (ms)", "Peak (abs)", "Δ (rel)", "σ"]
+        cell_text = []
+        for p in pulses:
+            seg = self.y[p["start_index"]:p["end_index"]]
+            peak_local_idx = p["start_index"] + int(np.argmax(seg))
+            peak_time = self.t[peak_local_idx]
+            peak_value = self.y[peak_local_idx]
+            rel_height = peak_value - self.baseline_curve[peak_local_idx]
+            duration_ms = (p["end_time_s"] - p["start_time_s"]) * 1000 + self.dt * 1000
+            cell_text.append([
+                f"{p['start_time_s']*1000:.2f}", f"{peak_time*1000:.2f}", f"{p['end_time_s']*1000:.2f}",
+                f"{duration_ms:.2f}", f"{peak_value:.3f}", f"{rel_height:.3f}", f"{self.std:.4f}",
+            ])
+
+        table = ax.table(cellText=cell_text, colLabels=col_labels, loc='center')
+        table.auto_set_font_size(False)
+        table.set_fontsize(8)
+        table.scale(1.0, 1.2)
+        ax.set_title(f"Pulses in view: {n_total}")
+        fig.tight_layout()
+        fig.show()
+
+    # --- Minimal inline evaluation for visible view (no import of evaluate_detection to avoid circular import)
+    def _read_csv_with_labels(self, csv_path, time_col="Time", value_col="Raw Value", assigned_col="Assigned", code_col="Code"):
+        times, values, assigned, codes = [], [], [], []
+        with open(csv_path, 'r', newline='') as f:
+            reader = csv.DictReader(f)
+            fieldnames = reader.fieldnames or []
+            for col in (time_col, value_col, assigned_col, code_col):
+                if col not in fieldnames:
+                    raise ValueError(f"列 '{col}' が見つかりません: {csv_path} (列: {fieldnames})")
+            for row in reader:
+                times.append(float(row[time_col]))
+                values.append(float(row[value_col]))
+                assigned.append(float(row[assigned_col]))
+                codes.append(row[code_col].strip())
+        return np.asarray(times), np.asarray(values), np.asarray(assigned), codes
+
+    def _ground_truth_intervals(self, codes, assigned, baseline_code='B'):
+        n = len(codes)
+        intervals = []
+        in_signal = False
+        start = None
+        for i in range(n):
+            is_signal = codes[i] != baseline_code
+            if is_signal and not in_signal:
+                start = i
+                in_signal = True
+            elif not is_signal and in_signal:
+                intervals.append({"start_index": start, "end_index": i, "assigned": float(np.max(assigned[start:i]))})
+                in_signal = False
+        if in_signal:
+            intervals.append({"start_index": start, "end_index": n, "assigned": float(np.max(assigned[start:n]))})
+        return intervals
+
+    def _match_pulses(self, detected_pulses, gt_intervals, iou_threshold=0.3):
+        pairs = []
+        for di, dp in enumerate(detected_pulses):
+            d0, d1 = dp["start_index"], dp["end_index"]
+            for gi, gt in enumerate(gt_intervals):
+                g0, g1 = gt["start_index"], gt["end_index"]
+                inter = max(0, min(d1, g1) - max(d0, g0))
+                if inter == 0:
+                    continue
+                union = max(d1, g1) - min(d0, g0)
+                iou = inter / union if union > 0 else 0.0
+                if iou >= iou_threshold:
+                    pairs.append((iou, di, gi))
+        pairs.sort(key=lambda x: x[0], reverse=True)
+        matched_d, matched_g = set(), set()
+        matches = []
+        for iou, di, gi in pairs:
+            if di in matched_d or gi in matched_g:
+                continue
+            matched_d.add(di)
+            matched_g.add(gi)
+            matches.append((di, gi, iou))
+        tp = len(matches)
+        fp = len(detected_pulses) - tp
+        fn = len(gt_intervals) - tp
+        return matches, tp, fp, fn
+
+    def on_evaluate_view(self, event):
+        """現在表示中の time 範囲で、元のラベル付きCSVがあれば簡易評価を行う。"""
+        import math
+        view_start, view_end = self.current_view_range()
+        npy_path = Path(self.current_path())
+        base = npy_path.stem
+        orig_base = base[:-4] if base.endswith("_raw") else base
+        seq_root = Path("sequencer/seq_data")
+        matches = list(seq_root.rglob(orig_base + ".csv"))
+        if not matches:
+            print(f"[WARN] Labeled CSV not found for {npy_path.name}. Looked for {orig_base}.csv under {seq_root}")
+            return
+        csv_path = matches[0]
+
+        try:
+            times, values, assigned, codes = self._read_csv_with_labels(csv_path)
+        except Exception as e:
+            print(f"[ERROR] Failed to read labeled CSV {csv_path}: {e}")
+            return
+
+        # map view time to sample indices (assume same sampling dt and alignment)
+        i0 = int(math.floor(view_start / self.dt))
+        i1 = int(math.ceil(view_end / self.dt))
+        i0 = max(0, i0)
+        i1 = min(len(values), i1)
+
+        # ground truth intervals restricted to view
+        gt_intervals = self._ground_truth_intervals(codes, assigned)
+        gt_in_view = []
+        for gt in gt_intervals:
+            if gt['end_index'] <= i0 or gt['start_index'] >= i1:
+                continue
+            # clip to view
+            g0 = max(gt['start_index'], i0)
+            g1 = min(gt['end_index'], i1)
+            gt_in_view.append({'start_index': g0, 'end_index': g1, 'assigned': gt['assigned']})
+
+        # detected pulses in view
+        detected_in_view = [
+            p for p in self.pulses if not (p['end_time_s'] < view_start or p['start_time_s'] > view_end)
+        ]
+
+        matches, tp, fp, fn = self._match_pulses(detected_in_view, gt_in_view)
+
+        print(f"[EVAL] View {view_start:.4f}-{view_end:.4f}s | CSV={csv_path.name} | TP={tp} FP={fp} FN={fn} (gt={len(gt_in_view)} det={len(detected_in_view)})")
+        # show a small dialog figure with summary
+        fig, ax = plt.subplots(figsize=(5, 2))
+        ax.axis('off')
+        txt = f"Evaluate View:\nCSV: {csv_path.name}\nview={view_start:.4f}-{view_end:.4f}s\nTP={tp} FP={fp} FN={fn}\nGT={len(gt_in_view)} Det={len(detected_in_view)}"
+        ax.text(0.01, 0.5, txt, fontsize=10, va='center')
+        fig.tight_layout()
+        fig.show()
 
 
 # ========= main =========
