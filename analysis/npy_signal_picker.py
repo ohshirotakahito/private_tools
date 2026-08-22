@@ -55,7 +55,7 @@ baseline(t) はSavitzky-Golay平滑化＋移動下位パーセンタイルフィ
 4. View range スライダーで見たい時間範囲を拡大/縮小
 5. Threshold k1 / Threshold k2 スライダーで検出感度を調整
 6. Reset View で全範囲表示に戻す
-7. Export (This File) / Export (All Files) でCSVに書き出す
+7. Export (This File) / Export CSV でCSVに書き出す
 
 必要パッケージ: numpy, scipy, matplotlib(>=3.5, RangeSliderを使用)
 """
@@ -97,13 +97,21 @@ SG_POLY = 3
 
 INITIAL_VIEW_WIDTH_S = 0.05  # 起動時・ファイル切替時の初期表示幅[s]
 
-# ベースライン推定窓の半分は原理的に信頼できない端の領域になるため、
-# その範囲を可視化・デフォルトでは検出結果からも除外する。
-EXCLUDE_EDGE_PULSES = True
+# ベースライン推定窓の半分に当たる端部を灰色で可視化する。
+# 端部のシグナルも集計・CSV出力の対象にし、edge_region列で識別できるようにする。
+EXCLUDE_EDGE_PULSES = False
 
 MAX_TABLE_ROWS = 20        # 右側の一覧表に表示するパルス数の上限（表示範囲内のもの）
 
 OUT_CSV_DEFAULT = "pulse_summary.csv"
+EXPORT_CSV_DIR = Path("analysis/export_csv")  # Export CSV のファイル別出力先
+
+PULSE_CSV_FIELDS = [
+    "file", "pulse_index", "start_time_s", "end_time_s", "duration_ms",
+    "width_ms", "peak", "baseline", "relative_height", "noise_std",
+    "threshold_k1", "threshold_k2", "threshold_t1", "threshold_t2",
+    "edge_region",
+]
 
 
 # ========= Utility =========
@@ -406,7 +414,7 @@ class NpySignalPicker:
         self.btn_next = Button(ax_next, "Next File")
         self.btn_reset = Button(ax_reset, "Reset View")
         self.btn_exp_cur = Button(ax_exp_cur, "Export (This File)")
-        self.btn_exp_all = Button(ax_exp_all, "Export (All Files)")
+        self.btn_exp_all = Button(ax_exp_all, "Export CSV")
         self.btn_stop = Button(ax_stop, "Stop")
 
         self.btn_prev.on_clicked(self.on_prev)
@@ -926,9 +934,9 @@ class NpySignalPicker:
             return
 
         offset = max(0, min(self.table_offset, max(0, n_total - MAX_TABLE_ROWS)))
-        # inline プレビューは上限6行だけにして重なりを避ける。フル表はポップアウトで表示。
-        preview_rows = 6
-        shown = self._last_visible_pulses[offset:offset + min(preview_rows, MAX_TABLE_ROWS)]
+        # 表に収まる最大行数まで表示する。件数が上限を超える場合は、
+        # スクロール位置(offset)を使ってすべてのパルスを参照できるようにする。
+        shown = self._last_visible_pulses[offset:offset + MAX_TABLE_ROWS]
 
         col_labels = ["Start\n(ms)", "Peak\n(ms)", "End\n(ms)", "Duration\n(ms)",
                      "Peak\n(abs)", "Δ\n(rel)", "σ\n(noise)"]
@@ -962,9 +970,11 @@ class NpySignalPicker:
         table.set_fontsize(7)
         table.scale(1.0, 1.2)
 
-        title = f"Pulses in view (preview): {n_total}"
-        if n_total > preview_rows:
-            title += f"  (showing 1-{preview_rows}; click 'Show Table')"
+        first_row = offset + 1
+        last_row = offset + len(shown)
+        title = f"Pulses in view: {n_total}"
+        if n_total > len(shown):
+            title += f"  (showing {first_row}-{last_row})"
         self.ax_table.set_title(title, fontsize=9)
 
     # ----- events -----
@@ -1012,7 +1022,11 @@ class NpySignalPicker:
               f"edge_excluded={self.exclude_edge_pulses})")
 
     def on_export_all(self, event):
-        all_rows = []
+        export_dir = EXPORT_CSV_DIR
+        export_dir.mkdir(parents=True, exist_ok=True)
+        saved_count = 0
+        total_pulses = 0
+
         for idx, path in enumerate(self.npy_files):
             try:
                 y = np.load(path)
@@ -1030,20 +1044,31 @@ class NpySignalPicker:
             n_before = len(rows)
             if self.exclude_edge_pulses:
                 rows = [r for r in rows if not r["edge_region"]]
-            all_rows.extend(rows)
-            print(f"[INFO] {idx+1}/{len(self.npy_files)} {path.name}: "
+            # 同名ファイルの上書きを避けるため、test_data 以下のフォルダ構成を維持する。
+            try:
+                relative_path = path.relative_to(TEST_DATA_ROOT)
+            except ValueError:
+                relative_path = Path(path.name)
+            out_csv = export_dir / relative_path.with_suffix(".csv")
+            self._write_csv(rows, out_csv, fieldnames=PULSE_CSV_FIELDS)
+            saved_count += 1
+            total_pulses += len(rows)
+            print(f"[SAVED] {idx+1}/{len(self.npy_files)} {out_csv}: "
                   f"{len(rows)}/{n_before} pulses (edge excluded={self.exclude_edge_pulses})")
 
-        self._write_csv(all_rows, self.out_csv)
-        print(f"[SAVED] {self.out_csv} ({len(all_rows)} pulses total from {len(self.npy_files)} files, "
-              f"k1={self.threshold_k1:.1f}, k2={self.threshold_k2:.1f})")
+        print(f"[SAVED] {saved_count} CSV files in {export_dir} "
+              f"({total_pulses} pulses total, k1={self.threshold_k1:.1f}, "
+              f"k2={self.threshold_k2:.1f})")
 
-    def _write_csv(self, rows, out_csv):
-        if not rows:
-            print("[INFO] 出力するパルスがありません。")
-            return
+    def _write_csv(self, rows, out_csv, fieldnames=None):
+        if fieldnames is None:
+            if not rows:
+                print("[INFO] 出力するパルスがありません。")
+                return
+            fieldnames = list(rows[0].keys())
 
-        fieldnames = list(rows[0].keys())
+        out_csv = Path(out_csv)
+        out_csv.parent.mkdir(parents=True, exist_ok=True)
         with open(out_csv, "w", newline="", encoding="utf-8") as f:
             writer = csv.DictWriter(f, fieldnames=fieldnames)
             writer.writeheader()
